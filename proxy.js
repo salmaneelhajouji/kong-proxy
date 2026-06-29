@@ -4,13 +4,8 @@ const http = require("http");
 const server = http.createServer((req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
-  // ✅ Bypass serveo warning
-  if (req.url.includes('serveo-skip-browser-warning')) {
-    const url = new URL(req.url, 'http://localhost');
-    req.url = url.pathname;
-  }
   // ✅ Health check pour Render
-  if (req.method === 'HEAD' || req.url === '/health' || req.url === '/') {
+  if (req.method === 'HEAD' || req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ status: 'ok' }));
     return;
@@ -34,7 +29,6 @@ const server = http.createServer((req, res) => {
   delete headers['Authorization'];
   delete headers['accept-encoding'];
 
-  // ✅ Routing selon le chemin
   let targetPath;
   if (req.url.includes('/embeddings')) {
     targetPath = '/ai-api/v1/embeddings';
@@ -44,7 +38,6 @@ const server = http.createServer((req, res) => {
     console.log(`→ Kong Chat: ${targetPath}`);
   }
 
-  // ✅ Collecte le body de la requête
   let reqChunks = [];
   req.on('data', chunk => reqChunks.push(chunk));
   req.on('end', () => {
@@ -53,16 +46,11 @@ const server = http.createServer((req, res) => {
     try {
       const reqJson = JSON.parse(reqBody.toString());
 
-      // ✅ Fix 1 — Force encoding_format float pour embeddings
       if (targetPath.includes('/embeddings')) {
-        if (reqJson.encoding_format === 'base64') {
-          console.log(`→ encoding_format base64 → float`);
-        }
         reqJson.encoding_format = 'float';
         console.log(`→ encoding_format forcé à float`);
       }
 
-      // ✅ Fix 2 — Détecte le 2ème appel avec tool results
       const hasToolResult = reqJson.messages && 
                             reqJson.messages.some(m => m.role === 'tool');
 
@@ -84,12 +72,10 @@ const server = http.createServer((req, res) => {
           })
           .join('\n\n');
 
-        console.log(`→ Tool results récupérés:\n${toolResults.slice(0, 300)}`);
+        console.log(`→ Tool results:\n${toolResults.slice(0, 300)}`);
 
         const newMessages = [];
-        if (systemMsg) {
-          newMessages.push({ role: 'system', content: systemMsg.content });
-        }
+        if (systemMsg) newMessages.push({ role: 'system', content: systemMsg.content });
         newMessages.push({
           role: 'user',
           content: `${userMsg?.content || ''}\n\n===RÉSULTATS PINECONE===\n${toolResults}\n========================`
@@ -97,9 +83,7 @@ const server = http.createServer((req, res) => {
 
         reqJson.messages = newMessages;
         delete reqJson.tools;
-
         console.log(`→ Messages reconstruits sans tool calls`);
-        console.log(`→ Nouveau body user:\n${newMessages[newMessages.length-1].content.slice(0, 400)}`);
 
       } else if (reqJson.messages) {
         reqJson.messages = reqJson.messages.map(msg => {
@@ -153,26 +137,21 @@ const server = http.createServer((req, res) => {
           if (json.data && isEmbedding) {
             const emb = json.data[0]?.embedding;
             console.log(`← Type embedding: ${typeof emb}`);
-            console.log(`← Est array: ${Array.isArray(emb)}`);
-            console.log(`← Premiers éléments: ${JSON.stringify(emb)?.slice(0, 100)}`);
+            console.log(`← Dimensions: ${Array.isArray(emb) ? emb.length : 'N/A'}`);
 
             if (typeof emb === 'string') {
-              console.log(`← Embedding en base64 — décodage en float32`);
+              console.log(`← Décodage base64 → float32`);
               const buffer = Buffer.from(emb, 'base64');
               const floats = [];
               for (let i = 0; i < buffer.length; i += 4) {
                 floats.push(buffer.readFloatLE(i));
               }
-              console.log(`← Embedding dimensions après décodage: ${floats.length}`);
+              console.log(`← Dimensions après décodage: ${floats.length}`);
               json.data[0].embedding = floats;
-
-              const correctedResponse = JSON.stringify(json);
               res.writeHead(proxyRes.statusCode, proxyRes.headers);
-              res.end(correctedResponse);
+              res.end(JSON.stringify(json));
               return;
             }
-
-            console.log(`← Embedding dimensions réelles : ${Array.isArray(emb) ? emb.length : 'N/A'}`);
           }
 
           if (proxyRes.statusCode === 400) {
@@ -198,4 +177,5 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(3000, () => console.log("Proxy running on http://localhost:3000"));
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
