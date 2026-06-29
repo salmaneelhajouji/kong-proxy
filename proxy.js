@@ -9,6 +9,12 @@ const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
     req.url = url.pathname;
   }
+  // ✅ Health check pour Render
+  if (req.method === 'HEAD' || req.url === '/health' || req.url === '/') {
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({ status: 'ok' }));
+    return;
+  }
 
   // ✅ Fake /v1/models
   if (req.url.includes('/models')) {
