@@ -46,34 +46,27 @@ const server = http.createServer((req, res) => {
     try {
       const reqJson = JSON.parse(reqBody.toString());
 
-      // ✅ Fix 1 — Force encoding_format float pour embeddings
+      // ✅ Fix embeddings — force float
       if (targetPath.includes('/embeddings')) {
+        delete reqJson.encoding_format;
         reqJson.encoding_format = 'float';
         console.log(`→ encoding_format forcé à float`);
       }
 
-      // ✅ Fix 2 — Détecte le 2ème appel avec tool results
+      // ✅ Fix tool results
       const hasToolResult = reqJson.messages &&
                             reqJson.messages.some(m => m.role === 'tool');
 
       if (hasToolResult) {
         console.log(`→ Détection 2ème appel avec tool results`);
-
         const systemMsg = reqJson.messages.find(m => m.role === 'system');
         const userMsg   = reqJson.messages.find(m => m.role === 'user');
-
         const toolResults = reqJson.messages
           .filter(m => m.role === 'tool')
           .map(m => {
-            try {
-              return JSON.stringify(JSON.parse(m.content), null, 2);
-            } catch(e) {
-              return m.content;
-            }
-          })
-          .join('\n\n');
-
-        console.log(`→ Tool results:\n${toolResults.slice(0, 300)}`);
+            try { return JSON.stringify(JSON.parse(m.content), null, 2); }
+            catch(e) { return m.content; }
+          }).join('\n\n');
 
         const newMessages = [];
         if (systemMsg) newMessages.push({ role: 'system', content: systemMsg.content });
@@ -81,10 +74,8 @@ const server = http.createServer((req, res) => {
           role: 'user',
           content: `${userMsg?.content || ''}\n\n===RÉSULTATS PINECONE===\n${toolResults}\n========================`
         });
-
         reqJson.messages = newMessages;
         delete reqJson.tools;
-        console.log(`→ Messages reconstruits sans tool calls`);
 
       } else if (reqJson.messages) {
         reqJson.messages = reqJson.messages.map(msg => {
@@ -101,11 +92,10 @@ const server = http.createServer((req, res) => {
       }
 
       const correctedBody = JSON.stringify(reqJson);
-      console.log(`→ Body envoyé à Kong:\n${correctedBody.slice(0, 400)}`);
       reqBody = Buffer.from(correctedBody);
 
     } catch(e) {
-      console.log(`→ Body non-JSON, envoi tel quel`);
+      console.log(`→ Body non-JSON`);
     }
 
     const isEmbedding = targetPath.includes('/embeddings');
@@ -132,25 +122,20 @@ const server = http.createServer((req, res) => {
           if (json.model) console.log(`← Modèle : ${json.model}`);
           if (json.usage) console.log(`← Tokens : prompt=${json.usage?.prompt_tokens} completion=${json.usage?.completion_tokens} total=${json.usage?.total_tokens}`);
 
+          // ✅ Fix embedding — ré-encode 3072 floats en base64
           if (json.data && isEmbedding) {
             const emb = json.data[0]?.embedding;
-            console.log(`← Type embedding: ${typeof emb} | Array: ${Array.isArray(emb)}`);
+            console.log(`← Embedding type: ${typeof emb} | array: ${Array.isArray(emb)} | dims: ${Array.isArray(emb) ? emb.length : 'N/A'}`);
 
-            if (typeof emb === 'string') {
-              console.log(`← Décodage base64 → float32`);
-              const buffer = Buffer.from(emb, 'base64');
-              const floats = [];
-              for (let i = 0; i < buffer.length; i += 4) {
-                floats.push(buffer.readFloatLE(i));
-              }
-              console.log(`← Dimensions après décodage: ${floats.length}`);
-              json.data[0].embedding = floats;
+            if (Array.isArray(emb)) {
+              const buffer = Buffer.allocUnsafe(emb.length * 4);
+              emb.forEach((val, i) => buffer.writeFloatLE(val, i * 4));
+              json.data[0].embedding = buffer.toString('base64');
+              console.log(`← Ré-encodé ${emb.length} floats → base64 (${buffer.length} bytes)`);
               res.writeHead(proxyRes.statusCode, proxyRes.headers);
               res.end(JSON.stringify(json));
               return;
             }
-
-            console.log(`← Dimensions: ${Array.isArray(emb) ? emb.length : 'N/A'}`);
           }
 
           if (proxyRes.statusCode === 400) {
@@ -158,7 +143,7 @@ const server = http.createServer((req, res) => {
           }
 
         } catch(e) {
-          console.log(`← Body (raw): ${body.toString().slice(0, 200)}`);
+          console.log(`← Body raw: ${body.toString().slice(0, 200)}`);
         }
 
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
