@@ -5,7 +5,7 @@ const server = http.createServer((req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
   // ✅ Health check pour Render
-  if (req.method === 'HEAD' || req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
+  if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ status: 'ok' }));
     return;
@@ -46,26 +46,27 @@ const server = http.createServer((req, res) => {
     try {
       const reqJson = JSON.parse(reqBody.toString());
 
+      // ✅ Fix 1 — Force encoding_format float pour embeddings
       if (targetPath.includes('/embeddings')) {
         reqJson.encoding_format = 'float';
         console.log(`→ encoding_format forcé à float`);
       }
 
-      const hasToolResult = reqJson.messages && 
+      // ✅ Fix 2 — Détecte le 2ème appel avec tool results
+      const hasToolResult = reqJson.messages &&
                             reqJson.messages.some(m => m.role === 'tool');
 
       if (hasToolResult) {
         console.log(`→ Détection 2ème appel avec tool results`);
 
         const systemMsg = reqJson.messages.find(m => m.role === 'system');
-        const userMsg = reqJson.messages.find(m => m.role === 'user');
+        const userMsg   = reqJson.messages.find(m => m.role === 'user');
 
         const toolResults = reqJson.messages
           .filter(m => m.role === 'tool')
           .map(m => {
             try {
-              const parsed = JSON.parse(m.content);
-              return JSON.stringify(parsed, null, 2);
+              return JSON.stringify(JSON.parse(m.content), null, 2);
             } catch(e) {
               return m.content;
             }
@@ -89,7 +90,7 @@ const server = http.createServer((req, res) => {
         reqJson.messages = reqJson.messages.map(msg => {
           if (msg.role === 'assistant' && msg.tool_calls) {
             msg.tool_calls = msg.tool_calls.map(tc => {
-              if (tc.function && tc.function.arguments && Array.isArray(tc.function.arguments)) {
+              if (tc.function?.arguments && Array.isArray(tc.function.arguments)) {
                 tc.function.arguments = JSON.stringify(tc.function.arguments);
               }
               return tc;
@@ -114,30 +115,26 @@ const server = http.createServer((req, res) => {
       port: 8443,
       path: targetPath,
       method: req.method,
-      headers: {
-        ...headers,
-        'content-length': reqBody.length
-      },
+      headers: { ...headers, 'content-length': reqBody.length },
       rejectUnauthorized: false
     };
 
     const proxy = https.request(options, (proxyRes) => {
       console.log(`← Kong status: ${proxyRes.statusCode}`);
-      
+
       let chunks = [];
       proxyRes.on('data', chunk => chunks.push(chunk));
       proxyRes.on('end', () => {
         const body = Buffer.concat(chunks);
-        
+
         try {
           const json = JSON.parse(body.toString());
           if (json.model) console.log(`← Modèle : ${json.model}`);
           if (json.usage) console.log(`← Tokens : prompt=${json.usage?.prompt_tokens} completion=${json.usage?.completion_tokens} total=${json.usage?.total_tokens}`);
-          
+
           if (json.data && isEmbedding) {
             const emb = json.data[0]?.embedding;
-            console.log(`← Type embedding: ${typeof emb}`);
-            console.log(`← Dimensions: ${Array.isArray(emb) ? emb.length : 'N/A'}`);
+            console.log(`← Type embedding: ${typeof emb} | Array: ${Array.isArray(emb)}`);
 
             if (typeof emb === 'string') {
               console.log(`← Décodage base64 → float32`);
@@ -152,11 +149,14 @@ const server = http.createServer((req, res) => {
               res.end(JSON.stringify(json));
               return;
             }
+
+            console.log(`← Dimensions: ${Array.isArray(emb) ? emb.length : 'N/A'}`);
           }
 
           if (proxyRes.statusCode === 400) {
             console.log(`← Erreur 400: ${body.toString().slice(0, 500)}`);
           }
+
         } catch(e) {
           console.log(`← Body (raw): ${body.toString().slice(0, 200)}`);
         }
