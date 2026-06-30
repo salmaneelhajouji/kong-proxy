@@ -1,6 +1,9 @@
 const https = require("https");
 const http = require("http");
 
+// ✅ Stockage en mémoire des derniers tokens et latence réels
+let lastUsage = {};
+
 const server = http.createServer((req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
@@ -8,6 +11,13 @@ const server = http.createServer((req, res) => {
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ status: 'ok' }));
+    return;
+  }
+
+  // ✅ Route pour récupérer les derniers tokens + latence réels
+  if (req.url === '/last-usage') {
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify(lastUsage));
     return;
   }
 
@@ -38,6 +48,9 @@ const server = http.createServer((req, res) => {
     console.log(`→ Kong Chat: ${targetPath}`);
   }
 
+  const isEmbedding = targetPath.includes('/embeddings');
+  const requestStartTime = Date.now(); // ✅ Mesure le début réel de l'appel
+
   let reqChunks = [];
   req.on('data', chunk => reqChunks.push(chunk));
   req.on('end', () => {
@@ -47,7 +60,7 @@ const server = http.createServer((req, res) => {
       const reqJson = JSON.parse(reqBody.toString());
 
       // ✅ Fix embeddings — force float
-      if (targetPath.includes('/embeddings')) {
+      if (isEmbedding) {
         delete reqJson.encoding_format;
         reqJson.encoding_format = 'float';
         console.log(`→ encoding_format forcé à float`);
@@ -98,8 +111,6 @@ const server = http.createServer((req, res) => {
       console.log(`→ Body non-JSON`);
     }
 
-    const isEmbedding = targetPath.includes('/embeddings');
-
     const options = {
       hostname: "35.198.99.79",
       port: 8443,
@@ -110,7 +121,9 @@ const server = http.createServer((req, res) => {
     };
 
     const proxy = https.request(options, (proxyRes) => {
-      console.log(`← Kong status: ${proxyRes.statusCode}`);
+      const requestEndTime = Date.now(); // ✅ Mesure la fin réelle de l'appel
+      const realLatencyMs = requestEndTime - requestStartTime;
+      console.log(`← Kong status: ${proxyRes.statusCode} | Latence réelle: ${realLatencyMs}ms`);
 
       let chunks = [];
       proxyRes.on('data', chunk => chunks.push(chunk));
@@ -121,6 +134,19 @@ const server = http.createServer((req, res) => {
           const json = JSON.parse(body.toString());
           if (json.model) console.log(`← Modèle : ${json.model}`);
           if (json.usage) console.log(`← Tokens : prompt=${json.usage?.prompt_tokens} completion=${json.usage?.completion_tokens} total=${json.usage?.total_tokens}`);
+
+          // ✅ Stocke les vrais tokens + latence du dernier appel CHAT (pas embedding)
+          if (json.usage && !isEmbedding) {
+            lastUsage = {
+              prompt_tokens: json.usage.prompt_tokens,
+              completion_tokens: json.usage.completion_tokens,
+              total_tokens: json.usage.total_tokens,
+              latency_ms: realLatencyMs,
+              model: json.model,
+              timestamp: Date.now()
+            };
+            console.log(`← Usage stocké: ${JSON.stringify(lastUsage)}`);
+          }
 
           // ✅ Fix embedding — ré-encode 3072 floats en base64
           if (json.data && isEmbedding) {
