@@ -136,18 +136,21 @@ const server = http.createServer((req, res) => {
           if (json.usage) console.log(`← Tokens : prompt=${json.usage?.prompt_tokens} completion=${json.usage?.completion_tokens} total=${json.usage?.total_tokens}`);
 
           // ✅ Stocke les vrais tokens + latence du dernier appel CHAT (pas embedding)
-          if (json.usage && !isEmbedding) {
-            lastUsage = {
+          // ✅ Injecte tokens + latence directement dans la réponse chat
+          if (json.usage && !isEmbedding && json.choices?.[0]?.message?.content) {
+            const usagePayload = {
               prompt_tokens: json.usage.prompt_tokens,
               completion_tokens: json.usage.completion_tokens,
               total_tokens: json.usage.total_tokens,
               latency_ms: realLatencyMs,
-              model: json.model,
-              timestamp: Date.now()
+              model: json.model
             };
-            console.log(`← Usage stocké: ${JSON.stringify(lastUsage)}`);
+            // Injecte en fin du content, invisible pour l'utilisateur
+            json.choices[0].message.content += 
+              `\n\n<!--KONG_USAGE:${JSON.stringify(usagePayload)}-->`;
+            
+            console.log(`← Usage injecté dans la réponse: ${JSON.stringify(usagePayload)}`);
           }
-
           // ✅ Fix embedding — ré-encode 3072 floats en base64
           if (json.data && isEmbedding) {
             const emb = json.data[0]?.embedding;
