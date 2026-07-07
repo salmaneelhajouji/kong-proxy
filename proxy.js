@@ -146,8 +146,7 @@ const server = http.createServer((req, res) => {
               model: json.model
             };
             // Injecte en fin du content, invisible pour l'utilisateur
-            json.choices[0].message.content += 
-              `\n\nKONG_USAGE:${JSON.stringify(usagePayload)}:END_USAGE`;            
+            lastUsage = usagePayload;           
             console.log(`← Usage injecté dans la réponse: ${JSON.stringify(usagePayload)}`);
           }
           // ✅ Fix embedding — ré-encode 3072 floats en base64
