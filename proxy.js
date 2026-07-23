@@ -142,6 +142,7 @@ const server = http.createServer((req, res) => {
               prompt_tokens: json.usage.prompt_tokens,
               completion_tokens: json.usage.completion_tokens,
               total_tokens: json.usage.total_tokens,
+              thinking_tokens: json.usage.total_tokens - json.usage.prompt_tokens - json.usage.completion_tokens,
               latency_ms: realLatencyMs,
               model: json.model
             };
