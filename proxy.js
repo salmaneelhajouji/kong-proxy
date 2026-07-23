@@ -7,6 +7,12 @@ let lastUsage = {};
 const server = http.createServer((req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
+  // 🔍 DEBUG — Vérification de la propagation du traceparent (W3C Trace Context)
+  console.log('=== DEBUG TRACEPARENT ===');
+  console.log('traceparent reçu ? :', req.headers['traceparent'] || 'ABSENT');
+  console.log('tracestate reçu ? :', req.headers['tracestate'] || 'ABSENT');
+  console.log('=== FIN DEBUG ===');
+
   // ✅ Health check pour Render
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
@@ -120,6 +126,11 @@ const server = http.createServer((req, res) => {
       rejectUnauthorized: false
     };
 
+    // 🔍 DEBUG — Vérification de ce qui est réellement envoyé à Kong
+    console.log('=== DEBUG HEADERS ENVOYÉS À KONG ===');
+    console.log('traceparent transmis ? :', options.headers['traceparent'] || 'ABSENT');
+    console.log('=== FIN DEBUG ===');
+
     const proxy = https.request(options, (proxyRes) => {
       const requestEndTime = Date.now(); // ✅ Mesure la fin réelle de l'appel
       const realLatencyMs = requestEndTime - requestStartTime;
@@ -142,6 +153,10 @@ const server = http.createServer((req, res) => {
               prompt_tokens: json.usage.prompt_tokens,
               completion_tokens: json.usage.completion_tokens,
               total_tokens: json.usage.total_tokens,
+              // ⚠️ thinking_tokens est une VALEUR CALCULÉE (total - prompt - completion),
+              // car Gemini/Kong ne l'expose pas directement dans un champ dédié.
+              // Hypothèse : total_tokens inclut le thinking, mais completion_tokens ne l'inclut pas
+              // (comportement observé, non documenté explicitement par Kong — à revalider si le comportement change)
               thinking_tokens: json.usage.total_tokens - json.usage.prompt_tokens - json.usage.completion_tokens,
               latency_ms: realLatencyMs,
               model: json.model
