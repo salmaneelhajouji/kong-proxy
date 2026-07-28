@@ -227,9 +227,20 @@ function parseExecution(detail) {
 }
 
 // ── Span construction ────────────────────────────────────────────────────────
+// ── Span construction ────────────────────────────────────────────────────────
 function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
   const { parent, nodes } = parsed;
   const parentSpanId = deriveSpanId(parent.executionId);
+
+  // ✅ CORRECTION DU BUG : on réinitialise explicitement forcedNextSpanId
+  // à null AVANT de créer le rootSpan, pour garantir qu'aucune valeur
+  // résiduelle laissée par une exécution précédente (ou un appel concurrent)
+  // ne vienne contaminer le span_id de CE rootSpan. Le customIdGenerator
+  // est une ressource partagée au niveau du module — sans cette précaution,
+  // un forcedNextSpanId oublié (jamais consommé à temps) peut être
+  // "récupéré" par le prochain startSpan() appelé n'importe où, y compris
+  // le rootSpan d'une toute autre exécution.
+  forcedNextSpanId = null;
 
   const fakeSpanContext = {
     traceId,
@@ -250,6 +261,15 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
     parentCtx
   );
 
+  // ✅ Vérification de sécurité supplémentaire : si jamais le span_id
+  // généré pour le rootSpan correspond par erreur à incomingParentSpanId
+  // (collision improbable mais possible), on log un avertissement explicite
+  // plutôt que de laisser passer silencieusement.
+  const rootSpanContext = rootSpan.spanContext();
+  if (incomingParentSpanId && rootSpanContext.spanId === incomingParentSpanId) {
+    console.error(`[otel] ⚠️ ALERTE: le rootSpan a hérité du span_id forcé (${incomingParentSpanId}) — ceci ne devrait jamais arriver. Vérifier la logique de forcedNextSpanId.`);
+  }
+
   rootSpan.setAttribute("n8n.execution.id", parent.executionId);
   rootSpan.setAttribute("n8n.execution.status", parent.status);
   rootSpan.setAttribute("n8n.execution.mode", parent.mode);
@@ -264,8 +284,8 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
 
   const spanContextMap = new Map();
 
-  const agentNode = nodes.find(n => 
-    (n.nodeType && n.nodeType.includes("agent")) || 
+  const agentNode = nodes.find(n =>
+    (n.nodeType && n.nodeType.includes("agent")) ||
     n.nodeName.toLowerCase().includes("agent")
   );
 
@@ -281,11 +301,10 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
     if (nodeEndMs > endMs) nodeEndMs = endMs;
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 1;
 
-    // Détermination du parent context
     let parentCtxToUse = rootCtx;
-    const isSubNode = (node.nodeType && node.nodeType.includes("@n8n/n8n-nodes-langchain")) || 
-                      node.nodeName.includes("Model") || 
-                      node.nodeName.includes("Vector Store") || 
+    const isSubNode = (node.nodeType && node.nodeType.includes("@n8n/n8n-nodes-langchain")) ||
+                      node.nodeName.includes("Model") ||
+                      node.nodeName.includes("Vector Store") ||
                       node.nodeName.includes("Embeddings");
 
     if (isSubNode && agentNode && spanContextMap.has(agentNode.nodeName)) {
@@ -296,12 +315,20 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
       parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(parentCtx));
     }
 
-    // 🔹 Alignement UNIQUE du SpanID pour le premier nœud Modèle
-    const isLlmNode = node.nodeName.includes("Model") || (node.nodeType && node.nodeType.includes("lm"));
+    // ✅ Exclut explicitement le nom du workflow lui-même (qui peut contenir
+    // "Agent" dans son nom, ex: "Agent Discovery...") de la détection isLlmNode,
+    // pour ne JAMAIS confondre un nœud avec le rootSpan.
+    const isLlmNode = (node.nodeName.includes("Model") || (node.nodeType && node.nodeType.includes("lm")))
+                       && node.nodeName !== parent.workflowName;
+
+    // ✅ On force le span_id JUSTE AVANT tracer.startSpan(), et on vérifie
+    // immédiatement après que la consommation a bien eu lieu sur CE span
+    // précis (pas un autre), via un flag local.
+    let expectedForcedId = null;
     if (incomingParentSpanId && isLlmNode && !incomingSpanIdAssigned) {
       forcedNextSpanId = incomingParentSpanId;
+      expectedForcedId = incomingParentSpanId;
       incomingSpanIdAssigned = true;
-      console.log(`[otel] SpanID aligné pour ${node.nodeName} -> ${incomingParentSpanId}`);
     }
 
     const childSpan = tracer.startSpan(
@@ -309,6 +336,15 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
       { startTime: nodeStartMs },
       parentCtxToUse
     );
+
+    if (expectedForcedId) {
+      const actualId = childSpan.spanContext().spanId;
+      if (actualId === expectedForcedId) {
+        console.log(`[otel] SpanID aligné pour ${node.nodeName} -> ${expectedForcedId}`);
+      } else {
+        console.error(`[otel] ⚠️ ÉCHEC alignement span_id pour ${node.nodeName}: attendu ${expectedForcedId}, obtenu ${actualId}`);
+      }
+    }
 
     childSpan.setAttribute("n8n.node.name", node.nodeName);
     childSpan.setAttribute("n8n.node.type", node.nodeType || "unknown");
@@ -331,6 +367,12 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
 
     childSpan.end(nodeEndMs);
   });
+
+  // ✅ Sécurité finale : on remet forcedNextSpanId à null après la boucle,
+  // au cas où il n'aurait jamais été consommé (par exemple si aucun nœud
+  // "isLlmNode" n'a été trouvé dans cette exécution) — pour ne jamais le
+  // laisser traîner et contaminer un futur appel.
+  forcedNextSpanId = null;
 
   rootSpan.end(endMs);
 
