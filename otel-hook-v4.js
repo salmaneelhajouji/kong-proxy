@@ -25,6 +25,21 @@ function parseHeaders(raw) {
   return result;
 }
 
+// ── 🔹 SOLUTION PROPRE : Custom IdGenerator OpenTelemetry ─────────────────────
+let forcedNextSpanId = null;
+
+const customIdGenerator = {
+  generateTraceId: () => crypto.randomBytes(16).toString("hex"),
+  generateSpanId: () => {
+    if (forcedNextSpanId) {
+      const id = forcedNextSpanId;
+      forcedNextSpanId = null; // Consommé pour le nœud LLM
+      return id;
+    }
+    return crypto.randomBytes(8).toString("hex");
+  }
+};
+
 let tracer = null;
 
 function setupTracer() {
@@ -37,12 +52,17 @@ function setupTracer() {
     headers: parseHeaders(OTEL_HEADERS_RAW),
   });
 
-  const provider = new BasicTracerProvider({ resource });
+  // Injection officielle du custom IdGenerator
+  const provider = new BasicTracerProvider({
+    resource,
+    idGenerator: customIdGenerator,
+  });
+
   provider.addSpanProcessor(new BatchSpanProcessor(exporter));
   provider.register();
 
   tracer = trace.getTracer("n8n-webhook-hook");
-  console.log(`[otel] Tracer initialisé -> ${OTEL_ENDPOINT}`);
+  console.log(`[otel] Tracer initialisé avec Custom IdGenerator -> ${OTEL_ENDPOINT}`);
 }
 
 // ── Trace/span ID derivation ─────────────────────────────────────────────────
@@ -236,10 +256,8 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
 
   const rootCtx = trace.setSpan(context.active(), rootSpan);
 
-  let lastEndMs = startMs;
-  let staleDetected = false;
-
-  const spanMap = new Map();
+  // Stocke les SpanContexts valides
+  const spanContextMap = new Map();
 
   const agentNode = nodes.find(n => 
     (n.nodeType && n.nodeType.includes("agent")) || 
@@ -247,58 +265,46 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
   );
 
   nodes.forEach(node => {
-    const durationMs = node.durationMs || 1;
-    let nodeStartMs = node.startTimeMs;
-
-    if (nodeStartMs < lastEndMs) staleDetected = true;
-    if (staleDetected) nodeStartMs = lastEndMs;
-
+    const durationMs = Math.max(node.durationMs || 1, 1);
+    let nodeStartMs = node.startTimeMs || startMs;
     let nodeEndMs = nodeStartMs + durationMs;
-    if (nodeEndMs > endMs) nodeEndMs = endMs;
-    lastEndMs = nodeEndMs;
 
-    // Détermination du contexte parent
-    let parentSpanToUse = null;
-    const isSubNode = node.nodeType?.includes("@n8n/n8n-nodes-langchain") || 
+    // Garantit que les bornes restent valides pour Langfuse
+    if (nodeStartMs < startMs) nodeStartMs = startMs;
+    if (nodeEndMs > endMs) nodeEndMs = endMs;
+
+    // Détermination du parent
+    let parentCtxToUse = rootCtx;
+    const isSubNode = (node.nodeType && node.nodeType.includes("@n8n/n8n-nodes-langchain")) || 
                       node.nodeName.includes("Model") || 
                       node.nodeName.includes("Vector Store") || 
                       node.nodeName.includes("Embeddings");
 
-    if (isSubNode && agentNode && spanMap.has(agentNode.nodeName)) {
-      parentSpanToUse = spanMap.get(agentNode.nodeName);
-    } else if (node.sourceNode && spanMap.has(node.sourceNode)) {
-      parentSpanToUse = spanMap.get(node.sourceNode);
+    if (isSubNode && agentNode && spanContextMap.has(agentNode.nodeName)) {
+      const parentCtx = spanContextMap.get(agentNode.nodeName);
+      parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(parentCtx));
+    } else if (node.sourceNode && spanContextMap.has(node.sourceNode)) {
+      const parentCtx = spanContextMap.get(node.sourceNode);
+      parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(parentCtx));
     }
 
-    const currentParentCtx = parentSpanToUse 
-      ? trace.setSpan(context.active(), parentSpanToUse)
-      : rootCtx;
-
-    // 🔹 FIX : Injection propre du SpanID pour OpenAI Chat Model sans corrompre l'objet OTEL
-    const isLlmNode = node.nodeName.includes("Model") || node.nodeType?.includes("lm");
-    const idGen = tracer._idGenerator || (tracer._tracer && tracer._tracer._idGenerator);
-    let originalGenerateSpanId = null;
-
-    if (incomingParentSpanId && isLlmNode && idGen) {
-      originalGenerateSpanId = idGen.generateSpanId;
-      idGen.generateSpanId = () => incomingParentSpanId; // Force l'ID de Kong
+    // 🔹 Forcer le SpanID pour correspondre à celui attendu par Kong
+    const isLlmNode = node.nodeName.includes("Model") || (node.nodeType && node.nodeType.includes("lm"));
+    if (incomingParentSpanId && isLlmNode) {
+      forcedNextSpanId = incomingParentSpanId;
+      console.log(`[otel] SpanID aligné pour ${node.nodeName} -> ${incomingParentSpanId}`);
     }
 
     const childSpan = tracer.startSpan(
       node.nodeName,
       { startTime: nodeStartMs },
-      currentParentCtx
+      parentCtxToUse
     );
-
-    // Restauration du générateur
-    if (originalGenerateSpanId && idGen) {
-      idGen.generateSpanId = originalGenerateSpanId;
-    }
 
     childSpan.setAttribute("n8n.node.name", node.nodeName);
     childSpan.setAttribute("n8n.node.type", node.nodeType || "unknown");
     childSpan.setAttribute("n8n.node.status", node.status || "unknown");
-    childSpan.setAttribute("n8n.node.duration_ms", node.durationMs || 0);
+    childSpan.setAttribute("n8n.node.duration_ms", durationMs);
     childSpan.setAttribute("n8n.node.execution_index", node.executionIndex || 0);
     childSpan.setAttribute("n8n.node.run_index", node.runIndex || 0);
     if (node.sourceNode) childSpan.setAttribute("n8n.node.source", node.sourceNode);
@@ -311,14 +317,16 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
     }
 
     childSpan.setStatus({ code: toOtelStatusCode(node.status) });
-    childSpan.end(nodeEndMs);
 
-    spanMap.set(node.nodeName, childSpan);
+    // 🔹 Sauvegarde du SpanContext AVANT la fin du Span
+    spanContextMap.set(node.nodeName, childSpan.spanContext());
+
+    childSpan.end(nodeEndMs);
   });
 
   rootSpan.end(endMs);
 
-  console.log(`[otel] Trace exportée [${parent.executionId}] n8n.${parent.workflowName} - ${parent.status} (${nodes.length} nœuds), trace_id=${traceId}`);
+  console.log(`[otel] Exportation réussie pour [${parent.executionId}] trace_id=${traceId}`);
 }
 
 // ── Public function ──────────────────────────────────────────────────────────
