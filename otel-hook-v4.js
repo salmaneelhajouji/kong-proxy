@@ -72,9 +72,12 @@ function setupTracer() {
   console.log(`[otel] Tracer initialisé -> ${OTEL_ENDPOINT}`);
 }
 
-// ── Trace/span ID derivation ─────────────────────────────────────────────────
 function deriveTraceId(seed) {
   return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
+}
+
+function deriveSpanId(seed) {
+  return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
 // ── Reverse lookup: trace_id -> execution_id ─────────────────────────────────
@@ -115,7 +118,6 @@ async function resolveExecutionIdFromTraceId(traceId) {
   return null;
 }
 
-// ── n8n API helpers ──────────────────────────────────────────────────────────
 async function n8nGet(path) {
   const url = `${N8N_HOST.replace(/\/$/, "")}/api/v1${path}`;
   const resp = await fetch(url, {
@@ -218,7 +220,6 @@ function parseExecution(detail) {
     });
   });
 
-  // 🔹 Tri intelligent : L'AI Agent passe TOUJOURS avant ses sous-nœuds (Model, Vector Store, Embeddings)
   nodes.sort((a, b) => {
     const aIsAgent = a.nodeName.toLowerCase().includes("agent") || (a.nodeType && a.nodeType.includes("agent"));
     const bIsAgent = b.nodeName.toLowerCase().includes("agent") || (b.nodeType && b.nodeType.includes("agent"));
@@ -236,13 +237,12 @@ function parseExecution(detail) {
 }
 
 // ── Span construction ────────────────────────────────────────────────────────
-function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
+function buildAndExportSpans(parsed, traceId) {
   const { parent, nodes } = parsed;
 
   const startMs = Date.parse(parent.startedAt);
   const endMs = Date.parse(parent.stoppedAt);
 
-  // Racine principale du workflow
   forcedTraceId = traceId;
   const rootSpan = tracer.startSpan(
     `n8n.${parent.workflowName}`,
@@ -262,8 +262,6 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
   const rootCtx = trace.setSpan(context.active(), rootSpan);
   const spanContextMap = new Map();
 
-  let incomingSpanIdAssigned = false;
-
   nodes.forEach(node => {
     const durationMs = Math.max(node.durationMs || 1, 1);
     let nodeStartMs = node.startTimeMs || startMs;
@@ -273,7 +271,6 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
     if (nodeEndMs > endMs) nodeEndMs = endMs;
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
-    // 🔹 RÈGLES DE PARENTÉ STRICTES
     let parentSpanContext = null;
     const nameLower = node.nodeName.toLowerCase();
     const typeLower = (node.nodeType || "").toLowerCase();
@@ -282,11 +279,9 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
     const isVectorStore = nameLower.includes("vector") || typeLower.includes("vectorstore") || nameLower.includes("pinecone");
     const isLlmModel = nameLower.includes("model") || typeLower.includes("lm");
 
-    // Nom du nœud Agent dans ce workflow
     const agentEntry = Array.from(spanContextMap.entries()).find(([name]) => name.toLowerCase().includes("agent"));
 
     if (isEmbeddings) {
-      // 1. Embeddings se rattache sous Pinecone Vector Store
       const vectorEntry = Array.from(spanContextMap.entries()).find(([name]) =>
         name.toLowerCase().includes("vector") || name.toLowerCase().includes("pinecone")
       );
@@ -296,13 +291,11 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
         parentSpanContext = agentEntry[1];
       }
     } else if (isLlmModel || isVectorStore) {
-      // 2. Chat Model et Vector Store se rattachent DIRECTEMENT sous l'AI Agent
       if (agentEntry) {
         parentSpanContext = agentEntry[1];
       }
     }
 
-    // 3. Pour les nœuds séquentiels (Webhook -> Code -> Loop -> Edit Fields -> Agent -> Wait -> Loop)
     if (!parentSpanContext && node.sourceNode && spanContextMap.has(node.sourceNode)) {
       parentSpanContext = spanContextMap.get(node.sourceNode);
     }
@@ -311,11 +304,13 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
       ? trace.setSpan(context.active(), trace.wrapSpanContext(parentSpanContext))
       : rootCtx;
 
-    // Alignement UNIQUE du SpanID pour le premier appel LLM (Kong)
-    if (incomingParentSpanId && isLlmModel && !incomingSpanIdAssigned) {
-      forcedNextSpanId = incomingParentSpanId;
-      incomingSpanIdAssigned = true;
-      console.log(`[otel] SpanID aligné pour ${node.nodeName} -> ${incomingParentSpanId}`);
+    // 🔹 Calcul déterministe du SpanID correspondant exactement à la réécriture faite par proxy.js
+    if (isLlmModel) {
+      forcedNextSpanId = deriveSpanId(traceId + `-chat-${node.runIndex}`);
+      console.log(`[otel] SpanID dérivé pour ${node.nodeName} (run ${node.runIndex}) -> ${forcedNextSpanId}`);
+    } else if (isEmbeddings) {
+      forcedNextSpanId = deriveSpanId(traceId + `-embeddings-${node.runIndex}`);
+      console.log(`[otel] SpanID dérivé pour ${node.nodeName} (run ${node.runIndex}) -> ${forcedNextSpanId}`);
     }
 
     const childSpan = tracer.startSpan(
@@ -360,7 +355,6 @@ async function processTraceparentAsync(traceparentHeader) {
       return;
     }
     const traceId = parts[1];
-    const incomingParentSpanId = parts[2];
 
     const executionId = await resolveExecutionIdFromTraceId(traceId);
     if (!executionId) return;
@@ -378,7 +372,7 @@ async function processTraceparentAsync(traceparentHeader) {
     }
 
     const parsed = parseExecution(detail);
-    buildAndExportSpans(parsed, traceId, incomingParentSpanId);
+    buildAndExportSpans(parsed, traceId);
 
   } catch (e) {
     console.error(`[otel] Erreur lors du traitement du traceparent ${traceparentHeader}:`, e.message);
