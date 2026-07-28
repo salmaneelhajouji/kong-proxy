@@ -359,6 +359,7 @@ function buildAndExportSpans(parsed, traceId) {
 }
 
 // ── Public function ──────────────────────────────────────────────────────────
+// ── Public function ──────────────────────────────────────────────────────────
 async function processTraceparentAsync(traceparentHeader) {
   try {
     const parts = traceparentHeader.split("-");
@@ -372,14 +373,15 @@ async function processTraceparentAsync(traceparentHeader) {
     if (!executionId) return;
 
     let detail = null;
-    for (let attempt = 0; attempt < 10; attempt++) {
+    // 🔹 25 tentatives de 2.5s = jusqu'à 62.5 secondes d'attente max
+    for (let attempt = 0; attempt < 25; attempt++) {
       detail = await n8nGet(`/executions/${executionId}?includeData=true`);
       if (detail && detail.stoppedAt) break;
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 2500));
     }
 
     if (!detail || !detail.stoppedAt) {
-      console.warn(`[otel] Exécution ${executionId} non terminée, abandon.`);
+      console.warn(`[otel] Exécution ${executionId} non terminée après 60s, abandon.`);
       return;
     }
 
