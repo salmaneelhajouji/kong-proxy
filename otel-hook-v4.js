@@ -200,7 +200,7 @@ function parseExecution(detail) {
   return { parent, nodes };
 }
 
-// ── Span construction with forced trace_id/span_id & hierarchy ──────────────
+// ── Span construction avec hiérarchie propre ────────────────────────────────
 function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
   const { parent, nodes } = parsed;
   const parentSpanId = deriveSpanId(parent.executionId);
@@ -239,10 +239,8 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
   let lastEndMs = startMs;
   let staleDetected = false;
 
-  // 🔹 Map pour gérer l'arborescence Parent-Enfant (SOLUTION 2)
   const spanMap = new Map();
 
-  // Identifier le nœud Agent principal (ex: AI Agent)
   const agentNode = nodes.find(n => 
     (n.nodeType && n.nodeType.includes("agent")) || 
     n.nodeName.toLowerCase().includes("agent")
@@ -259,19 +257,16 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
     if (nodeEndMs > endMs) nodeEndMs = endMs;
     lastEndMs = nodeEndMs;
 
-    // --- SOLUTION 2 : Détermination du Parent Context ---
+    // Détermination du contexte parent
     let parentSpanToUse = null;
-
     const isSubNode = node.nodeType?.includes("@n8n/n8n-nodes-langchain") || 
                       node.nodeName.includes("Model") || 
                       node.nodeName.includes("Vector Store") || 
                       node.nodeName.includes("Embeddings");
 
     if (isSubNode && agentNode && spanMap.has(agentNode.nodeName)) {
-      // Les sous-nœuds LangChain se rattachent sous l'AI Agent
       parentSpanToUse = spanMap.get(agentNode.nodeName);
     } else if (node.sourceNode && spanMap.has(node.sourceNode)) {
-      // Les nœuds séquentiels se rattachent à leur nœud précédent
       parentSpanToUse = spanMap.get(node.sourceNode);
     }
 
@@ -279,17 +274,25 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
       ? trace.setSpan(context.active(), parentSpanToUse)
       : rootCtx;
 
+    // 🔹 FIX : Injection propre du SpanID pour OpenAI Chat Model sans corrompre l'objet OTEL
+    const isLlmNode = node.nodeName.includes("Model") || node.nodeType?.includes("lm");
+    const idGen = tracer._idGenerator || (tracer._tracer && tracer._tracer._idGenerator);
+    let originalGenerateSpanId = null;
+
+    if (incomingParentSpanId && isLlmNode && idGen) {
+      originalGenerateSpanId = idGen.generateSpanId;
+      idGen.generateSpanId = () => incomingParentSpanId; // Force l'ID de Kong
+    }
+
     const childSpan = tracer.startSpan(
       node.nodeName,
       { startTime: nodeStartMs },
       currentParentCtx
     );
 
-    // --- SOLUTION 1 : Surcharge du SpanID pour aligner Kong sous OpenAI Chat Model ---
-    const isLlmNode = node.nodeName.includes("Model") || node.nodeType?.includes("lm");
-    if (incomingParentSpanId && isLlmNode && childSpan._spanContext) {
-      childSpan._spanContext.spanId = incomingParentSpanId;
-      console.log(`[otel] Alignement : SpanID de '${node.nodeName}' forcé à ${incomingParentSpanId}`);
+    // Restauration du générateur
+    if (originalGenerateSpanId && idGen) {
+      idGen.generateSpanId = originalGenerateSpanId;
     }
 
     childSpan.setAttribute("n8n.node.name", node.nodeName);
@@ -315,10 +318,10 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
 
   rootSpan.end(endMs);
 
-  console.log(`[otel] Exported trace [${parent.executionId}] n8n.${parent.workflowName} - ${parent.status} (${nodes.length} node spans), trace_id=${traceId}`);
+  console.log(`[otel] Trace exportée [${parent.executionId}] n8n.${parent.workflowName} - ${parent.status} (${nodes.length} nœuds), trace_id=${traceId}`);
 }
 
-// ── Public function: process one traceparent ─────────────────────────────────
+// ── Public function ──────────────────────────────────────────────────────────
 async function processTraceparentAsync(traceparentHeader) {
   try {
     const parts = traceparentHeader.split("-");
@@ -327,7 +330,7 @@ async function processTraceparentAsync(traceparentHeader) {
       return;
     }
     const traceId = parts[1];
-    const incomingParentSpanId = parts[2]; // 🔹 SOLUTION 1 : Récupération du SpanID transmis par n8n à Kong
+    const incomingParentSpanId = parts[2];
 
     const executionId = await resolveExecutionIdFromTraceId(traceId);
     if (!executionId) return;
@@ -340,7 +343,7 @@ async function processTraceparentAsync(traceparentHeader) {
     }
 
     if (!detail || !detail.stoppedAt) {
-      console.warn(`[otel] Exécution ${executionId} pas encore terminée après plusieurs tentatives, abandon.`);
+      console.warn(`[otel] Exécution ${executionId} non terminée, abandon.`);
       return;
     }
 
@@ -357,9 +360,7 @@ const PROCESSED_TTL_MS = 5 * 60 * 1000;
 
 function triggerTraceFromTraceparent(traceparentHeader) {
   if (!traceparentHeader) return;
-  if (processedTraceIds.has(traceparentHeader)) {
-    return;
-  }
+  if (processedTraceIds.has(traceparentHeader)) return;
   processedTraceIds.add(traceparentHeader);
   setTimeout(() => processedTraceIds.delete(traceparentHeader), PROCESSED_TTL_MS);
 
