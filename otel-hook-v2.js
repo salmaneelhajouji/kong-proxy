@@ -10,6 +10,8 @@ const N8N_HOST = process.env.N8N_HOST;
 const N8N_API_KEY = process.env.N8N_API_KEY;
 const OTEL_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
 const OTEL_HEADERS_RAW = process.env.OTEL_EXPORTER_OTLP_HEADERS || "";
+// Plage de recherche pour la résolution inversée trace_id -> execution_id
+const REVERSE_SEARCH_RANGE = parseInt(process.env.REVERSE_SEARCH_RANGE || "300", 10);
 
 function parseHeaders(raw) {
   const result = {};
@@ -44,15 +46,65 @@ function setupTracer() {
 }
 
 // ── Trace/span ID derivation ─────────────────────────────────────────────────
-// IMPORTANT : formule IDENTIQUE côté Kong (via traceparent reçu) — le trace_id
-// dérivé ici DOIT correspondre à celui déjà utilisé par les spans Kong pour
-// cette même exécution.
+// IMPORTANT : formule IDENTIQUE à celle utilisée côté n8n (nœud Code in
+// JavaScript) pour générer le traceparent envoyé à Kong.
 function deriveTraceId(seed) {
   return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
 }
 
 function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
+}
+
+// ── Reverse lookup: trace_id -> execution_id ─────────────────────────────────
+// On reçoit un traceparent (donc un trace_id) via le header custom, mais on a
+// besoin de execution_id (en clair) pour interroger l'API n8n. Comme le hash
+// n'est pas réversible mathématiquement, on retrouve execution_id en testant
+// une plage de valeurs récentes et en comparant leur hash au trace_id reçu.
+//
+// Optimisation : on garde en cache le dernier execution_id connu (via l'API
+// n8n) pour ne tester qu'une petite fenêtre autour de cette valeur, au lieu
+// de rebalayer une plage arbitraire à chaque appel.
+let lastKnownExecutionId = null;
+
+async function fetchLatestExecutionId() {
+  const url = `${N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=1`;
+  const resp = await fetch(url, {
+    headers: { "X-N8N-API-KEY": N8N_API_KEY, "Accept": "application/json" },
+  });
+  if (!resp.ok) throw new Error(`n8n API error ${resp.status}`);
+  const body = await resp.json();
+  const latest = body.data?.[0]?.id;
+  return latest ? parseInt(latest, 10) : null;
+}
+
+async function resolveExecutionIdFromTraceId(traceId) {
+  // Rafraîchit le curseur "dernier execution_id connu" si on ne l'a pas encore,
+  // ou périodiquement pour rester à jour.
+  if (lastKnownExecutionId === null) {
+    try {
+      lastKnownExecutionId = await fetchLatestExecutionId();
+    } catch (e) {
+      console.error(`[otel] Impossible de récupérer le dernier execution_id:`, e.message);
+      return null;
+    }
+  }
+
+  // Teste une fenêtre de recherche autour du dernier ID connu, en partant du
+  // plus récent vers le plus ancien (l'exécution en cours est probablement
+  // très récente, donc on la trouve vite).
+  const upperBound = lastKnownExecutionId + 20; // marge de sécurité si de nouvelles exécutions sont apparues entre-temps
+  const lowerBound = Math.max(1, lastKnownExecutionId - REVERSE_SEARCH_RANGE);
+
+  for (let candidate = upperBound; candidate >= lowerBound; candidate--) {
+    if (deriveTraceId(candidate) === traceId) {
+      lastKnownExecutionId = Math.max(lastKnownExecutionId, candidate); // met à jour le curseur
+      return candidate;
+    }
+  }
+
+  console.warn(`[otel] Aucun execution_id trouvé pour trace_id=${traceId} dans la plage [${lowerBound}, ${upperBound}]`);
+  return null;
 }
 
 // ── n8n API helpers ──────────────────────────────────────────────────────────
@@ -71,7 +123,6 @@ async function n8nGet(path) {
 }
 
 function toOtelStatusCode(n8nStatus) {
-  // 0 = UNSET, 1 = OK, 2 = ERROR (valeurs numériques SpanStatusCode)
   if (n8nStatus === "success") return 1;
   if (n8nStatus === "error") return 2;
   return 0;
@@ -124,12 +175,9 @@ function parseExecution(detail) {
 }
 
 // ── Span construction with forced trace_id/span_id ──────────────────────────
-function buildAndExportSpans(parsed) {
+function buildAndExportSpans(parsed, traceId) {
   const { parent, nodes } = parsed;
-  const seed = parent.executionId;
-
-  const traceId = deriveTraceId(seed);
-  const parentSpanId = deriveSpanId(seed);
+  const parentSpanId = deriveSpanId(parent.executionId);
 
   const fakeSpanContext = {
     traceId,
@@ -199,20 +247,26 @@ function buildAndExportSpans(parsed) {
   console.log(`[otel] Exported trace [${parent.executionId}] n8n.${parent.workflowName} - ${parent.status} (${nodes.length} node spans), trace_id=${traceId}`);
 }
 
-// ── Public function: process one execution by ID ────────────────────────────
-// Appelée de façon FIRE-AND-FORGET (asynchrone, sans bloquer la réponse à Kong)
-async function processExecutionAsync(executionId) {
+// ── Public function: process one traceparent ─────────────────────────────────
+async function processTraceparentAsync(traceparentHeader) {
   try {
-    // Petit délai pour laisser le temps à n8n de finaliser l'écriture des
-    // données d'exécution avant qu'on ne les récupère via l'API — l'exécution
-    // est probablement encore en cours au moment où ce header arrive
-    // (le premier appel LLM se produit AU MILIEU de l'exécution, pas à la fin).
-    // On retente plusieurs fois si l'exécution n'est pas encore "stoppedAt".
+    // Extrait le trace_id du header traceparent : "00-{trace_id}-{span_id}-01"
+    const parts = traceparentHeader.split("-");
+    if (parts.length < 4) {
+      console.warn(`[otel] traceparent malformé: ${traceparentHeader}`);
+      return;
+    }
+    const traceId = parts[1];
+
+    const executionId = await resolveExecutionIdFromTraceId(traceId);
+    if (!executionId) return; // déjà loggé dans resolveExecutionIdFromTraceId
+
+    // Attend que l'exécution soit terminée (stoppedAt renseigné)
     let detail = null;
     for (let attempt = 0; attempt < 10; attempt++) {
       detail = await n8nGet(`/executions/${executionId}?includeData=true`);
       if (detail.stoppedAt) break;
-      await new Promise(r => setTimeout(r, 3000)); // attend 3s avant de réessayer
+      await new Promise(r => setTimeout(r, 3000));
     }
 
     if (!detail || !detail.stoppedAt) {
@@ -221,29 +275,28 @@ async function processExecutionAsync(executionId) {
     }
 
     const parsed = parseExecution(detail);
-    buildAndExportSpans(parsed);
+    buildAndExportSpans(parsed, traceId);
 
   } catch (e) {
-    console.error(`[otel] Erreur lors du traitement de l'exécution ${executionId}:`, e.message);
+    console.error(`[otel] Erreur lors du traitement du traceparent ${traceparentHeader}:`, e.message);
   }
 }
 
-// ── Dédoublonnage simple : évite de traiter deux fois la même exécution
-// si plusieurs appels LLM (chat + embeddings) de la même exécution arrivent
-// avec le même x-n8n-execution-id
-const processedExecutions = new Set();
-const PROCESSED_TTL_MS = 5 * 60 * 1000; // 5 minutes
+// ── Dédoublonnage : évite de traiter deux fois le même trace_id
+// si plusieurs appels LLM de la même exécution arrivent avec le même traceparent
+const processedTraceIds = new Set();
+const PROCESSED_TTL_MS = 5 * 60 * 1000;
 
-function triggerExecutionTrace(executionId) {
-  if (!executionId) return;
-  if (processedExecutions.has(executionId)) {
-    return; // déjà traité (ou en cours de traitement) pour cette exécution
+function triggerTraceFromTraceparent(traceparentHeader) {
+  if (!traceparentHeader) return;
+  if (processedTraceIds.has(traceparentHeader)) {
+    return;
   }
-  processedExecutions.add(executionId);
-  setTimeout(() => processedExecutions.delete(executionId), PROCESSED_TTL_MS);
+  processedTraceIds.add(traceparentHeader);
+  setTimeout(() => processedTraceIds.delete(traceparentHeader), PROCESSED_TTL_MS);
 
   // Fire-and-forget : ne bloque jamais la réponse HTTP vers Kong/n8n
-  processExecutionAsync(executionId);
+  processTraceparentAsync(traceparentHeader);
 }
 
-module.exports = { setupTracer, triggerExecutionTrace };
+module.exports = { setupTracer, triggerTraceFromTraceparent };
