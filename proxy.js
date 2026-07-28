@@ -13,6 +13,7 @@ const server = http.createServer((req, res) => {
   console.log('=== DEBUG TRACEPARENT ===');
   console.log('traceparent reçu ? :', req.headers['traceparent'] || 'ABSENT');
   console.log('tracestate reçu ? :', req.headers['tracestate'] || 'ABSENT');
+  console.log('x-debug-runindex reçu:', req.headers['x-debug-runindex'] || 'ABSENT');
   console.log('=== FIN DEBUG ===');
 
   // ✅ NOUVEAU — Récupère l'execution_id envoyé par n8n et déclenche
