@@ -1,6 +1,6 @@
 const https = require("https");
 const http = require("http");
-const { setupTracer, triggerTraceFromTraceparent } = require("./otel-hook-v3.js");
+const { setupTracer, triggerTraceFromTraceparent } = require("./otel-hook-v4.js");
 setupTracer();
 
 // ✅ Stockage en mémoire des derniers tokens et latence réels
