@@ -236,7 +236,7 @@ function parseExecution(detail) {
   return { parent, nodes };
 }
 
-// ── Span construction ────────────────────────────────────────────────────────
+// ── Span construction avec attribution des icônes ─────────────────────────────
 function buildAndExportSpans(parsed, traceId) {
   const { parent, nodes } = parsed;
 
@@ -278,6 +278,7 @@ function buildAndExportSpans(parsed, traceId) {
     const isEmbeddings = nameLower.includes("embedding") || typeLower.includes("embeddings");
     const isVectorStore = nameLower.includes("vector") || typeLower.includes("vectorstore") || nameLower.includes("pinecone");
     const isLlmModel = nameLower.includes("model") || typeLower.includes("lm");
+    const isAgent = nameLower.includes("agent") || typeLower.includes("agent");
 
     const agentEntry = Array.from(spanContextMap.entries()).find(([name]) => name.toLowerCase().includes("agent"));
 
@@ -304,13 +305,10 @@ function buildAndExportSpans(parsed, traceId) {
       ? trace.setSpan(context.active(), trace.wrapSpanContext(parentSpanContext))
       : rootCtx;
 
-    // 🔹 Calcul déterministe du SpanID correspondant exactement à la réécriture faite par proxy.js
     if (isLlmModel) {
       forcedNextSpanId = deriveSpanId(traceId + `-chat-${node.runIndex}`);
-      console.log(`[otel] SpanID dérivé pour ${node.nodeName} (run ${node.runIndex}) -> ${forcedNextSpanId}`);
     } else if (isEmbeddings) {
       forcedNextSpanId = deriveSpanId(traceId + `-embeddings-${node.runIndex}`);
-      console.log(`[otel] SpanID dérivé pour ${node.nodeName} (run ${node.runIndex}) -> ${forcedNextSpanId}`);
     }
 
     const childSpan = tracer.startSpan(
@@ -318,6 +316,20 @@ function buildAndExportSpans(parsed, traceId) {
       { startTime: nodeStartMs },
       parentCtxToUse
     );
+
+    // 🔹 ATTRIBUTS POUR LES ICÔNES DANS LANGFUSE
+    if (isLlmModel) {
+      childSpan.setAttribute("openinference.type", "LLM");
+      childSpan.setAttribute("gen_ai.system", "google");
+      childSpan.setAttribute("gen_ai.request.model", "gemini-3.5-flash");
+    } else if (isVectorStore || isEmbeddings) {
+      childSpan.setAttribute("openinference.type", "RETRIEVER");
+      childSpan.setAttribute("db.system", "pinecone");
+    } else if (isAgent) {
+      childSpan.setAttribute("openinference.type", "AGENT");
+    } else {
+      childSpan.setAttribute("openinference.type", "CHAIN");
+    }
 
     childSpan.setAttribute("n8n.node.name", node.nodeName);
     childSpan.setAttribute("n8n.node.type", node.nodeType || "unknown");
