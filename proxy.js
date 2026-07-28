@@ -1,45 +1,40 @@
 const https = require("https");
 const http = require("http");
+const crypto = require("crypto");
 const { setupTracer, triggerTraceFromTraceparent } = require("./otel-hook-v4.js");
 setupTracer();
 
-// ✅ Stockage en mémoire des derniers tokens et latence réels
+// ✅ Compteurs d'appels HTTP par traceId pour dériver des Span IDs uniques
+const traceCallCounters = new Map();
+
+function deriveSpanId(seed) {
+  return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
+}
+
 let lastUsage = {};
 
 const server = http.createServer((req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
-  // 🔍 DEBUG — Vérification de la propagation du traceparent (W3C Trace Context)
-  console.log('=== DEBUG TRACEPARENT ===');
-  console.log('traceparent reçu ? :', req.headers['traceparent'] || 'ABSENT');
-  console.log('tracestate reçu ? :', req.headers['tracestate'] || 'ABSENT');
-  console.log('x-debug-runindex reçu:', req.headers['x-debug-runindex'] || 'ABSENT');
-  console.log('=== FIN DEBUG ===');
-
-  // ✅ NOUVEAU — Récupère l'execution_id envoyé par n8n et déclenche
-  // l'export de trace vers LangFuse en arrière-plan (fire-and-forget,
-  // ne bloque jamais la requête vers Kong)
   const traceparentHeader = req.headers['traceparent'];
   if (traceparentHeader) {
     console.log(`[trace-hook] traceparent reçu: ${traceparentHeader}`);
     triggerTraceFromTraceparent(traceparentHeader);
   }
 
-  // ✅ Health check pour Render
+  // ✅ Health check
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ status: 'ok' }));
     return;
   }
 
-  // ✅ Route pour récupérer les derniers tokens + latence réels
   if (req.url === '/last-usage') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify(lastUsage));
     return;
   }
 
-  // ✅ Fake /v1/models
   if (req.url.includes('/models')) {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({
@@ -67,7 +62,33 @@ const server = http.createServer((req, res) => {
   }
 
   const isEmbedding = targetPath.includes('/embeddings');
-  const requestStartTime = Date.now(); // ✅ Mesure le début réel de l'appel
+  const requestStartTime = Date.now();
+
+  // 🔹 Réécriture dynamique du traceparent transmis à Kong
+  if (traceparentHeader) {
+    const parts = traceparentHeader.split("-");
+    if (parts.length >= 4) {
+      const traceId = parts[1];
+
+      if (!traceCallCounters.has(traceId)) {
+        traceCallCounters.set(traceId, { chat: 0, embedding: 0 });
+        setTimeout(() => traceCallCounters.delete(traceId), 10 * 60 * 1000);
+      }
+      const counters = traceCallCounters.get(traceId);
+
+      let derivedSpanId;
+      if (isEmbedding) {
+        derivedSpanId = deriveSpanId(traceId + `-embeddings-${counters.embedding}`);
+        counters.embedding++;
+      } else {
+        derivedSpanId = deriveSpanId(traceId + `-chat-${counters.chat}`);
+        counters.chat++;
+      }
+
+      headers['traceparent'] = `00-${traceId}-${derivedSpanId}-01`;
+      console.log(`→ Header traceparent réécrit pour Kong: 00-${traceId}-${derivedSpanId}-01`);
+    }
+  }
 
   let reqChunks = [];
   req.on('data', chunk => reqChunks.push(chunk));
@@ -77,14 +98,11 @@ const server = http.createServer((req, res) => {
     try {
       const reqJson = JSON.parse(reqBody.toString());
 
-      // ✅ Fix embeddings — force float
       if (isEmbedding) {
         delete reqJson.encoding_format;
         reqJson.encoding_format = 'float';
-        console.log(`→ encoding_format forcé à float`);
       }
 
-      // ✅ Fix tool results
       const hasToolResult = reqJson.messages &&
                             reqJson.messages.some(m => m.role === 'tool');
 
@@ -138,13 +156,8 @@ const server = http.createServer((req, res) => {
       rejectUnauthorized: false
     };
 
-    // 🔍 DEBUG — Vérification de ce qui est réellement envoyé à Kong
-    console.log('=== DEBUG HEADERS ENVOYÉS À KONG ===');
-    console.log('traceparent transmis ? :', options.headers['traceparent'] || 'ABSENT');
-    console.log('=== FIN DEBUG ===');
-
     const proxy = https.request(options, (proxyRes) => {
-      const requestEndTime = Date.now(); // ✅ Mesure la fin réelle de l'appel
+      const requestEndTime = Date.now();
       const realLatencyMs = requestEndTime - requestStartTime;
       console.log(`← Kong status: ${proxyRes.statusCode} | Latence réelle: ${realLatencyMs}ms`);
 
@@ -155,48 +168,32 @@ const server = http.createServer((req, res) => {
 
         try {
           const json = JSON.parse(body.toString());
-          if (json.model) console.log(`← Modèle : ${json.model}`);
-          if (json.usage) console.log(`← Tokens : prompt=${json.usage?.prompt_tokens} completion=${json.usage?.completion_tokens} total=${json.usage?.total_tokens}`);
 
-          // ✅ Stocke les vrais tokens + latence du dernier appel CHAT (pas embedding)
-          // ✅ Injecte tokens + latence directement dans la réponse chat
           if (json.usage && !isEmbedding && json.choices?.[0]?.message?.content) {
             const usagePayload = {
               prompt_tokens: json.usage.prompt_tokens,
               completion_tokens: json.usage.completion_tokens,
               total_tokens: json.usage.total_tokens,
-              // ⚠️ thinking_tokens est une VALEUR CALCULÉE (total - prompt - completion),
-              // car Gemini/Kong ne l'expose pas directement dans un champ dédié.
               thinking_tokens: json.usage.total_tokens - json.usage.prompt_tokens - json.usage.completion_tokens,
               latency_ms: realLatencyMs,
               model: json.model
             };
             lastUsage = usagePayload;
-            console.log(`← Usage injecté dans la réponse: ${JSON.stringify(usagePayload)}`);
           }
-          // ✅ Fix embedding — ré-encode 3072 floats en base64
+
           if (json.data && isEmbedding) {
             const emb = json.data[0]?.embedding;
-            console.log(`← Embedding type: ${typeof emb} | array: ${Array.isArray(emb)} | dims: ${Array.isArray(emb) ? emb.length : 'N/A'}`);
-
             if (Array.isArray(emb)) {
               const buffer = Buffer.allocUnsafe(emb.length * 4);
               emb.forEach((val, i) => buffer.writeFloatLE(val, i * 4));
               json.data[0].embedding = buffer.toString('base64');
-              console.log(`← Ré-encodé ${emb.length} floats → base64 (${buffer.length} bytes)`);
               res.writeHead(proxyRes.statusCode, proxyRes.headers);
               res.end(JSON.stringify(json));
               return;
             }
           }
 
-          if (proxyRes.statusCode === 400) {
-            console.log(`← Erreur 400: ${body.toString().slice(0, 500)}`);
-          }
-
-        } catch(e) {
-          console.log(`← Body raw: ${body.toString().slice(0, 200)}`);
-        }
+        } catch(e) {}
 
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
         res.end(body);
