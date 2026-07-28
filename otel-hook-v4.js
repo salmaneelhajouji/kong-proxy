@@ -26,15 +26,23 @@ function parseHeaders(raw) {
 }
 
 // ── Custom IdGenerator OpenTelemetry ─────────────────────────────────────────
+let forcedTraceId = null;
 let forcedNextSpanId = null;
 
 const customIdGenerator = {
-  generateTraceId: () => crypto.randomBytes(16).toString("hex"),
+  generateTraceId: () => {
+    if (forcedTraceId) {
+      const tid = forcedTraceId;
+      forcedTraceId = null;
+      return tid;
+    }
+    return crypto.randomBytes(16).toString("hex");
+  },
   generateSpanId: () => {
     if (forcedNextSpanId) {
-      const id = forcedNextSpanId;
-      forcedNextSpanId = null; // Consommé immédiatement pour éviter toute réutilisation
-      return id;
+      const sid = forcedNextSpanId;
+      forcedNextSpanId = null;
+      return sid;
     }
     return crypto.randomBytes(8).toString("hex");
   }
@@ -61,16 +69,12 @@ function setupTracer() {
   provider.register();
 
   tracer = trace.getTracer("n8n-webhook-hook");
-  console.log(`[otel] Tracer initialisé avec Custom IdGenerator -> ${OTEL_ENDPOINT}`);
+  console.log(`[otel] Tracer initialisé -> ${OTEL_ENDPOINT}`);
 }
 
 // ── Trace/span ID derivation ─────────────────────────────────────────────────
 function deriveTraceId(seed) {
   return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
-}
-
-function deriveSpanId(seed) {
-  return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
 // ── Reverse lookup: trace_id -> execution_id ─────────────────────────────────
@@ -214,61 +218,25 @@ function parseExecution(detail) {
     });
   });
 
-  // 🔹 Tri prioritaire : place l'Agent avant les sous-nœuds
-  nodes.sort((a, b) => {
-    const aIsAgent = a.nodeName.toLowerCase().includes("agent") || (a.nodeType && a.nodeType.includes("agent"));
-    const bIsAgent = b.nodeName.toLowerCase().includes("agent") || (b.nodeType && b.nodeType.includes("agent"));
-    if (aIsAgent && !bIsAgent) return -1;
-    if (!aIsAgent && bIsAgent) return 1;
-    return (a.executionIndex || 0) - (b.executionIndex || 0) || a.runIndex - b.runIndex;
-  });
+  // Tri strictement chronologique par heure de début
+  nodes.sort((a, b) => (a.startTimeMs || 0) - (b.startTimeMs || 0) || (a.executionIndex || 0) - (b.executionIndex || 0));
 
   return { parent, nodes };
 }
 
 // ── Span construction ────────────────────────────────────────────────────────
-// ── Span construction ────────────────────────────────────────────────────────
 function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
   const { parent, nodes } = parsed;
-  const parentSpanId = deriveSpanId(parent.executionId);
-
-  // ✅ CORRECTION DU BUG : on réinitialise explicitement forcedNextSpanId
-  // à null AVANT de créer le rootSpan, pour garantir qu'aucune valeur
-  // résiduelle laissée par une exécution précédente (ou un appel concurrent)
-  // ne vienne contaminer le span_id de CE rootSpan. Le customIdGenerator
-  // est une ressource partagée au niveau du module — sans cette précaution,
-  // un forcedNextSpanId oublié (jamais consommé à temps) peut être
-  // "récupéré" par le prochain startSpan() appelé n'importe où, y compris
-  // le rootSpan d'une toute autre exécution.
-  forcedNextSpanId = null;
-
-  const fakeSpanContext = {
-    traceId,
-    spanId: parentSpanId,
-    traceFlags: 1,
-    isRemote: true,
-  };
-
-  const fakeParentSpan = trace.wrapSpanContext(fakeSpanContext);
-  const parentCtx = trace.setSpan(context.active(), fakeParentSpan);
 
   const startMs = Date.parse(parent.startedAt);
   const endMs = Date.parse(parent.stoppedAt);
 
+  // 🔹 VRAIE RACINE : Injection de traceId via customIdGenerator sans faux parentSpanId
+  forcedTraceId = traceId;
   const rootSpan = tracer.startSpan(
     `n8n.${parent.workflowName}`,
-    { startTime: startMs },
-    parentCtx
+    { startTime: startMs }
   );
-
-  // ✅ Vérification de sécurité supplémentaire : si jamais le span_id
-  // généré pour le rootSpan correspond par erreur à incomingParentSpanId
-  // (collision improbable mais possible), on log un avertissement explicite
-  // plutôt que de laisser passer silencieusement.
-  const rootSpanContext = rootSpan.spanContext();
-  if (incomingParentSpanId && rootSpanContext.spanId === incomingParentSpanId) {
-    console.error(`[otel] ⚠️ ALERTE: le rootSpan a hérité du span_id forcé (${incomingParentSpanId}) — ceci ne devrait jamais arriver. Vérifier la logique de forcedNextSpanId.`);
-  }
 
   rootSpan.setAttribute("n8n.execution.id", parent.executionId);
   rootSpan.setAttribute("n8n.execution.status", parent.status);
@@ -281,15 +249,8 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
   rootSpan.setStatus({ code: toOtelStatusCode(parent.status) });
 
   const rootCtx = trace.setSpan(context.active(), rootSpan);
-
   const spanContextMap = new Map();
 
-  const agentNode = nodes.find(n =>
-    (n.nodeType && n.nodeType.includes("agent")) ||
-    n.nodeName.toLowerCase().includes("agent")
-  );
-
-  // 🔹 Empêche l'assignation multiple de la même SpanID
   let incomingSpanIdAssigned = false;
 
   nodes.forEach(node => {
@@ -299,36 +260,36 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
 
     if (nodeStartMs < startMs) nodeStartMs = startMs;
     if (nodeEndMs > endMs) nodeEndMs = endMs;
-    if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 1;
+    if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
-    let parentCtxToUse = rootCtx;
+    // Détermination du contexte parent
+    let parentSpanContext = null;
     const isSubNode = (node.nodeType && node.nodeType.includes("@n8n/n8n-nodes-langchain")) ||
                       node.nodeName.includes("Model") ||
                       node.nodeName.includes("Vector Store") ||
                       node.nodeName.includes("Embeddings");
 
-    if (isSubNode && agentNode && spanContextMap.has(agentNode.nodeName)) {
-      const parentCtx = spanContextMap.get(agentNode.nodeName);
-      parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(parentCtx));
-    } else if (node.sourceNode && spanContextMap.has(node.sourceNode)) {
-      const parentCtx = spanContextMap.get(node.sourceNode);
-      parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(parentCtx));
+    if (isSubNode) {
+      const agentEntry = Array.from(spanContextMap.entries()).find(([name]) => name.toLowerCase().includes("agent"));
+      if (agentEntry) {
+        parentSpanContext = agentEntry[1];
+      }
     }
 
-    // ✅ Exclut explicitement le nom du workflow lui-même (qui peut contenir
-    // "Agent" dans son nom, ex: "Agent Discovery...") de la détection isLlmNode,
-    // pour ne JAMAIS confondre un nœud avec le rootSpan.
-    const isLlmNode = (node.nodeName.includes("Model") || (node.nodeType && node.nodeType.includes("lm")))
-                       && node.nodeName !== parent.workflowName;
+    if (!parentSpanContext && node.sourceNode && spanContextMap.has(node.sourceNode)) {
+      parentSpanContext = spanContextMap.get(node.sourceNode);
+    }
 
-    // ✅ On force le span_id JUSTE AVANT tracer.startSpan(), et on vérifie
-    // immédiatement après que la consommation a bien eu lieu sur CE span
-    // précis (pas un autre), via un flag local.
-    let expectedForcedId = null;
+    const parentCtxToUse = parentSpanContext
+      ? trace.setSpan(context.active(), trace.wrapSpanContext(parentSpanContext))
+      : rootCtx;
+
+    // Alignement UNIQUE du SpanID pour OpenAI Chat Model1
+    const isLlmNode = node.nodeName.includes("Model") || (node.nodeType && node.nodeType.includes("lm"));
     if (incomingParentSpanId && isLlmNode && !incomingSpanIdAssigned) {
       forcedNextSpanId = incomingParentSpanId;
-      expectedForcedId = incomingParentSpanId;
       incomingSpanIdAssigned = true;
+      console.log(`[otel] SpanID aligné pour ${node.nodeName} -> ${incomingParentSpanId}`);
     }
 
     const childSpan = tracer.startSpan(
@@ -336,15 +297,6 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
       { startTime: nodeStartMs },
       parentCtxToUse
     );
-
-    if (expectedForcedId) {
-      const actualId = childSpan.spanContext().spanId;
-      if (actualId === expectedForcedId) {
-        console.log(`[otel] SpanID aligné pour ${node.nodeName} -> ${expectedForcedId}`);
-      } else {
-        console.error(`[otel] ⚠️ ÉCHEC alignement span_id pour ${node.nodeName}: attendu ${expectedForcedId}, obtenu ${actualId}`);
-      }
-    }
 
     childSpan.setAttribute("n8n.node.name", node.nodeName);
     childSpan.setAttribute("n8n.node.type", node.nodeType || "unknown");
@@ -368,12 +320,6 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
     childSpan.end(nodeEndMs);
   });
 
-  // ✅ Sécurité finale : on remet forcedNextSpanId à null après la boucle,
-  // au cas où il n'aurait jamais été consommé (par exemple si aucun nœud
-  // "isLlmNode" n'a été trouvé dans cette exécution) — pour ne jamais le
-  // laisser traîner et contaminer un futur appel.
-  forcedNextSpanId = null;
-
   rootSpan.end(endMs);
 
   console.log(`[otel] Exportation réussie pour [${parent.executionId}] trace_id=${traceId}`);
@@ -396,8 +342,8 @@ async function processTraceparentAsync(traceparentHeader) {
     let detail = null;
     for (let attempt = 0; attempt < 10; attempt++) {
       detail = await n8nGet(`/executions/${executionId}?includeData=true`);
-      if (detail.stoppedAt) break;
-      await new Promise(r => setTimeout(r, 3000));
+      if (detail && detail.stoppedAt) break;
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     if (!detail || !detail.stoppedAt) {
@@ -413,7 +359,6 @@ async function processTraceparentAsync(traceparentHeader) {
   }
 }
 
-// 🔹 Déduplication par traceId uniquement
 const processedTraceIds = new Set();
 const PROCESSED_TTL_MS = 5 * 60 * 1000;
 
