@@ -25,7 +25,7 @@ function parseHeaders(raw) {
   return result;
 }
 
-// ── 🔹 SOLUTION PROPRE : Custom IdGenerator OpenTelemetry ─────────────────────
+// ── Custom IdGenerator OpenTelemetry ─────────────────────────────────────────
 let forcedNextSpanId = null;
 
 const customIdGenerator = {
@@ -33,7 +33,7 @@ const customIdGenerator = {
   generateSpanId: () => {
     if (forcedNextSpanId) {
       const id = forcedNextSpanId;
-      forcedNextSpanId = null; // Consommé pour le nœud LLM
+      forcedNextSpanId = null; // Consommé immédiatement pour éviter toute réutilisation
       return id;
     }
     return crypto.randomBytes(8).toString("hex");
@@ -52,7 +52,6 @@ function setupTracer() {
     headers: parseHeaders(OTEL_HEADERS_RAW),
   });
 
-  // Injection officielle du custom IdGenerator
   const provider = new BasicTracerProvider({
     resource,
     idGenerator: customIdGenerator,
@@ -215,12 +214,19 @@ function parseExecution(detail) {
     });
   });
 
-  nodes.sort((a, b) => (a.executionIndex || 0) - (b.executionIndex || 0) || a.runIndex - b.runIndex);
+  // 🔹 Tri prioritaire : place l'Agent avant les sous-nœuds
+  nodes.sort((a, b) => {
+    const aIsAgent = a.nodeName.toLowerCase().includes("agent") || (a.nodeType && a.nodeType.includes("agent"));
+    const bIsAgent = b.nodeName.toLowerCase().includes("agent") || (b.nodeType && b.nodeType.includes("agent"));
+    if (aIsAgent && !bIsAgent) return -1;
+    if (!aIsAgent && bIsAgent) return 1;
+    return (a.executionIndex || 0) - (b.executionIndex || 0) || a.runIndex - b.runIndex;
+  });
 
   return { parent, nodes };
 }
 
-// ── Span construction avec hiérarchie propre ────────────────────────────────
+// ── Span construction ────────────────────────────────────────────────────────
 function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
   const { parent, nodes } = parsed;
   const parentSpanId = deriveSpanId(parent.executionId);
@@ -256,7 +262,6 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
 
   const rootCtx = trace.setSpan(context.active(), rootSpan);
 
-  // Stocke les SpanContexts valides
   const spanContextMap = new Map();
 
   const agentNode = nodes.find(n => 
@@ -264,16 +269,19 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
     n.nodeName.toLowerCase().includes("agent")
   );
 
+  // 🔹 Empêche l'assignation multiple de la même SpanID
+  let incomingSpanIdAssigned = false;
+
   nodes.forEach(node => {
     const durationMs = Math.max(node.durationMs || 1, 1);
     let nodeStartMs = node.startTimeMs || startMs;
     let nodeEndMs = nodeStartMs + durationMs;
 
-    // Garantit que les bornes restent valides pour Langfuse
     if (nodeStartMs < startMs) nodeStartMs = startMs;
     if (nodeEndMs > endMs) nodeEndMs = endMs;
+    if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 1;
 
-    // Détermination du parent
+    // Détermination du parent context
     let parentCtxToUse = rootCtx;
     const isSubNode = (node.nodeType && node.nodeType.includes("@n8n/n8n-nodes-langchain")) || 
                       node.nodeName.includes("Model") || 
@@ -288,10 +296,11 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
       parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(parentCtx));
     }
 
-    // 🔹 Forcer le SpanID pour correspondre à celui attendu par Kong
+    // 🔹 Alignement UNIQUE du SpanID pour le premier nœud Modèle
     const isLlmNode = node.nodeName.includes("Model") || (node.nodeType && node.nodeType.includes("lm"));
-    if (incomingParentSpanId && isLlmNode) {
+    if (incomingParentSpanId && isLlmNode && !incomingSpanIdAssigned) {
       forcedNextSpanId = incomingParentSpanId;
+      incomingSpanIdAssigned = true;
       console.log(`[otel] SpanID aligné pour ${node.nodeName} -> ${incomingParentSpanId}`);
     }
 
@@ -318,7 +327,6 @@ function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
 
     childSpan.setStatus({ code: toOtelStatusCode(node.status) });
 
-    // 🔹 Sauvegarde du SpanContext AVANT la fin du Span
     spanContextMap.set(node.nodeName, childSpan.spanContext());
 
     childSpan.end(nodeEndMs);
@@ -363,14 +371,19 @@ async function processTraceparentAsync(traceparentHeader) {
   }
 }
 
+// 🔹 Déduplication par traceId uniquement
 const processedTraceIds = new Set();
 const PROCESSED_TTL_MS = 5 * 60 * 1000;
 
 function triggerTraceFromTraceparent(traceparentHeader) {
   if (!traceparentHeader) return;
-  if (processedTraceIds.has(traceparentHeader)) return;
-  processedTraceIds.add(traceparentHeader);
-  setTimeout(() => processedTraceIds.delete(traceparentHeader), PROCESSED_TTL_MS);
+  const parts = traceparentHeader.split("-");
+  if (parts.length < 2) return;
+  const traceId = parts[1];
+
+  if (processedTraceIds.has(traceId)) return;
+  processedTraceIds.add(traceId);
+  setTimeout(() => processedTraceIds.delete(traceId), PROCESSED_TTL_MS);
 
   processTraceparentAsync(traceparentHeader);
 }
