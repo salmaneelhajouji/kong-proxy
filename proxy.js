@@ -1,5 +1,9 @@
 const https = require("https");
 const http = require("http");
+const { setupTracer, triggerExecutionTrace } = require("./otel-hook-v2.js");
+
+// ✅ Initialise le tracer OTel une seule fois au démarrage du serveur
+setupTracer();
 
 // ✅ Stockage en mémoire des derniers tokens et latence réels
 let lastUsage = {};
@@ -12,6 +16,15 @@ const server = http.createServer((req, res) => {
   console.log('traceparent reçu ? :', req.headers['traceparent'] || 'ABSENT');
   console.log('tracestate reçu ? :', req.headers['tracestate'] || 'ABSENT');
   console.log('=== FIN DEBUG ===');
+
+  // ✅ NOUVEAU — Récupère l'execution_id envoyé par n8n et déclenche
+  // l'export de trace vers LangFuse en arrière-plan (fire-and-forget,
+  // ne bloque jamais la requête vers Kong)
+  const n8nExecutionId = req.headers['x-n8n-execution-id'];
+  if (n8nExecutionId) {
+    console.log(`[trace-hook] execution_id reçu: ${n8nExecutionId}`);
+    triggerExecutionTrace(n8nExecutionId);
+  }
 
   // ✅ Health check pour Render
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
@@ -155,14 +168,11 @@ const server = http.createServer((req, res) => {
               total_tokens: json.usage.total_tokens,
               // ⚠️ thinking_tokens est une VALEUR CALCULÉE (total - prompt - completion),
               // car Gemini/Kong ne l'expose pas directement dans un champ dédié.
-              // Hypothèse : total_tokens inclut le thinking, mais completion_tokens ne l'inclut pas
-              // (comportement observé, non documenté explicitement par Kong — à revalider si le comportement change)
               thinking_tokens: json.usage.total_tokens - json.usage.prompt_tokens - json.usage.completion_tokens,
               latency_ms: realLatencyMs,
               model: json.model
             };
-            // Injecte en fin du content, invisible pour l'utilisateur
-            lastUsage = usagePayload;           
+            lastUsage = usagePayload;
             console.log(`← Usage injecté dans la réponse: ${JSON.stringify(usagePayload)}`);
           }
           // ✅ Fix embedding — ré-encode 3072 floats en base64
