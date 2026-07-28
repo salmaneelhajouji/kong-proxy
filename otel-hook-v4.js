@@ -11,7 +11,6 @@ const N8N_API_KEY = process.env.N8N_API_KEY;
 const OTEL_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
 const OTEL_HEADERS_RAW = process.env.OTEL_EXPORTER_OTLP_HEADERS || "";
 const REVERSE_SEARCH_RANGE = parseInt(process.env.REVERSE_SEARCH_RANGE || "300", 10);
-// Limite de taille pour éviter d'envoyer des payloads énormes (system prompts complets, etc.)
 const MAX_ATTR_LENGTH = parseInt(process.env.MAX_ATTR_LENGTH || "8000", 10);
 
 function parseHeaders(raw) {
@@ -114,13 +113,6 @@ function toOtelStatusCode(n8nStatus) {
   return 0;
 }
 
-// ── Extraction Input/Output d'un nœud, quel que soit son format ─────────────
-// Couvre 2 cas observés dans l'API n8n :
-//  1. Nœuds "flux classique" (Webhook, Code, Edit Fields, AI Agent) :
-//     data: { main: [[ { json: {...} } ]] }
-//  2. Nœuds "sub-node" LangChain (Chat Model, Vector Store) :
-//     inputOverride: { ai_languageModel: [[ { json: {...} } ]] } (input)
-//     data: { ai_languageModel: [[ { json: {...} } ]] } (output)
 function truncate(value) {
   const str = typeof value === "string" ? value : JSON.stringify(value);
   if (!str) return str;
@@ -128,7 +120,6 @@ function truncate(value) {
 }
 
 function extractFirstJson(container, key) {
-  // container[key] est généralement de la forme [[ { json: {...} }, ... ]]
   const branch = container?.[key];
   if (!Array.isArray(branch) || !Array.isArray(branch[0]) || !branch[0][0]) return null;
   return branch[0][0].json ?? null;
@@ -138,7 +129,6 @@ function extractIO(nodeRun) {
   let inputData = null;
   let outputData = null;
 
-  // Cas 1 : nœuds sub-node LangChain, input dans inputOverride
   if (nodeRun.inputOverride) {
     for (const key of Object.keys(nodeRun.inputOverride)) {
       const json = extractFirstJson(nodeRun.inputOverride, key);
@@ -146,18 +136,11 @@ function extractIO(nodeRun) {
     }
   }
 
-  // Cas 2 : output — chercher dans data.main en priorité, sinon autres clés (ai_languageModel, etc.)
   if (nodeRun.data) {
     if (nodeRun.data.main) {
       const json = extractFirstJson(nodeRun.data, "main");
-      if (json) {
-        outputData = json;
-        // Pour les nœuds "flux classique", l'input n'est pas dans ce même run —
-        // il vient du nœud précédent, donc on ne le déduit pas ici (laissé null
-        // sauf si déjà rempli par inputOverride ci-dessus).
-      }
+      if (json) { outputData = json; }
     } else {
-      // Sub-node sans "main" : prend la première clé disponible (ex: ai_languageModel)
       for (const key of Object.keys(nodeRun.data)) {
         const json = extractFirstJson(nodeRun.data, key);
         if (json) { outputData = json; break; }
@@ -168,7 +151,6 @@ function extractIO(nodeRun) {
   return { inputData, outputData };
 }
 
-// ── Parse execution detail into OTEL-ready structure ────────────────────────
 function parseExecution(detail) {
   const nodeTypeLookup = {};
   (detail.workflowData?.nodes || []).forEach(node => {
@@ -218,8 +200,8 @@ function parseExecution(detail) {
   return { parent, nodes };
 }
 
-// ── Span construction with forced trace_id/span_id ──────────────────────────
-function buildAndExportSpans(parsed, traceId) {
+// ── Span construction with forced trace_id/span_id & hierarchy ──────────────
+function buildAndExportSpans(parsed, traceId, incomingParentSpanId) {
   const { parent, nodes } = parsed;
   const parentSpanId = deriveSpanId(parent.executionId);
 
@@ -257,6 +239,15 @@ function buildAndExportSpans(parsed, traceId) {
   let lastEndMs = startMs;
   let staleDetected = false;
 
+  // 🔹 Map pour gérer l'arborescence Parent-Enfant (SOLUTION 2)
+  const spanMap = new Map();
+
+  // Identifier le nœud Agent principal (ex: AI Agent)
+  const agentNode = nodes.find(n => 
+    (n.nodeType && n.nodeType.includes("agent")) || 
+    n.nodeName.toLowerCase().includes("agent")
+  );
+
   nodes.forEach(node => {
     const durationMs = node.durationMs || 1;
     let nodeStartMs = node.startTimeMs;
@@ -268,11 +259,38 @@ function buildAndExportSpans(parsed, traceId) {
     if (nodeEndMs > endMs) nodeEndMs = endMs;
     lastEndMs = nodeEndMs;
 
+    // --- SOLUTION 2 : Détermination du Parent Context ---
+    let parentSpanToUse = null;
+
+    const isSubNode = node.nodeType?.includes("@n8n/n8n-nodes-langchain") || 
+                      node.nodeName.includes("Model") || 
+                      node.nodeName.includes("Vector Store") || 
+                      node.nodeName.includes("Embeddings");
+
+    if (isSubNode && agentNode && spanMap.has(agentNode.nodeName)) {
+      // Les sous-nœuds LangChain se rattachent sous l'AI Agent
+      parentSpanToUse = spanMap.get(agentNode.nodeName);
+    } else if (node.sourceNode && spanMap.has(node.sourceNode)) {
+      // Les nœuds séquentiels se rattachent à leur nœud précédent
+      parentSpanToUse = spanMap.get(node.sourceNode);
+    }
+
+    const currentParentCtx = parentSpanToUse 
+      ? trace.setSpan(context.active(), parentSpanToUse)
+      : rootCtx;
+
     const childSpan = tracer.startSpan(
       node.nodeName,
       { startTime: nodeStartMs },
-      rootCtx
+      currentParentCtx
     );
+
+    // --- SOLUTION 1 : Surcharge du SpanID pour aligner Kong sous OpenAI Chat Model ---
+    const isLlmNode = node.nodeName.includes("Model") || node.nodeType?.includes("lm");
+    if (incomingParentSpanId && isLlmNode && childSpan._spanContext) {
+      childSpan._spanContext.spanId = incomingParentSpanId;
+      console.log(`[otel] Alignement : SpanID de '${node.nodeName}' forcé à ${incomingParentSpanId}`);
+    }
 
     childSpan.setAttribute("n8n.node.name", node.nodeName);
     childSpan.setAttribute("n8n.node.type", node.nodeType || "unknown");
@@ -282,8 +300,6 @@ function buildAndExportSpans(parsed, traceId) {
     childSpan.setAttribute("n8n.node.run_index", node.runIndex || 0);
     if (node.sourceNode) childSpan.setAttribute("n8n.node.source", node.sourceNode);
 
-    // ✅ NOUVEAU — Input/Output complets, visibles dans LangFuse comme
-    // champs "Input"/"Output" natifs (pas juste des attributs custom)
     if (node.inputData) {
       childSpan.setAttribute("input.value", truncate(node.inputData));
     }
@@ -293,6 +309,8 @@ function buildAndExportSpans(parsed, traceId) {
 
     childSpan.setStatus({ code: toOtelStatusCode(node.status) });
     childSpan.end(nodeEndMs);
+
+    spanMap.set(node.nodeName, childSpan);
   });
 
   rootSpan.end(endMs);
@@ -309,6 +327,7 @@ async function processTraceparentAsync(traceparentHeader) {
       return;
     }
     const traceId = parts[1];
+    const incomingParentSpanId = parts[2]; // 🔹 SOLUTION 1 : Récupération du SpanID transmis par n8n à Kong
 
     const executionId = await resolveExecutionIdFromTraceId(traceId);
     if (!executionId) return;
@@ -326,7 +345,7 @@ async function processTraceparentAsync(traceparentHeader) {
     }
 
     const parsed = parseExecution(detail);
-    buildAndExportSpans(parsed, traceId);
+    buildAndExportSpans(parsed, traceId, incomingParentSpanId);
 
   } catch (e) {
     console.error(`[otel] Erreur lors du traitement du traceparent ${traceparentHeader}:`, e.message);
