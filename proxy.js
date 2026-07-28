@@ -20,10 +20,10 @@ const server = http.createServer((req, res) => {
   // ✅ NOUVEAU — Récupère l'execution_id envoyé par n8n et déclenche
   // l'export de trace vers LangFuse en arrière-plan (fire-and-forget,
   // ne bloque jamais la requête vers Kong)
-  const n8nExecutionId = req.headers['x-n8n-execution-id'];
-  if (n8nExecutionId) {
-    console.log(`[trace-hook] execution_id reçu: ${n8nExecutionId}`);
-    triggerExecutionTrace(n8nExecutionId);
+  const traceparentHeader = req.headers['traceparent'];
+  if (traceparentHeader) {
+    console.log(`[trace-hook] traceparent reçu: ${traceparentHeader}`);
+    triggerTraceFromTraceparent(traceparentHeader);
   }
 
   // ✅ Health check pour Render
