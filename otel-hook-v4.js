@@ -25,6 +25,36 @@ function parseHeaders(raw) {
   return result;
 }
 
+// ── Détecteurs robustes basés sur le Type ET le Nom ─────────────────────────
+function isAgentNode(node) {
+  const t = (node.nodeType || "").toLowerCase();
+  const n = (node.nodeName || "").toLowerCase();
+  return t.includes("agent") || n.includes("agent");
+}
+
+function isLlmNode(node) {
+  const t = (node.nodeType || "").toLowerCase();
+  const n = (node.nodeName || "").toLowerCase();
+  return t.includes("lmchat") || t.includes("openai") || n.includes("llm") || n.includes("model");
+}
+
+function isVectorNode(node) {
+  const t = (node.nodeType || "").toLowerCase();
+  const n = (node.nodeName || "").toLowerCase();
+  return t.includes("vector") || t.includes("pinecone") || n.includes("vector") || n.includes("pinecone");
+}
+
+function isEmbeddingsNode(node) {
+  const t = (node.nodeType || "").toLowerCase();
+  const n = (node.nodeName || "").toLowerCase();
+  return t.includes("embedding") || n.includes("embedding");
+}
+
+function isSubNode(node) {
+  const t = (node.nodeType || "").toLowerCase();
+  return t.includes("@n8n/n8n-nodes-langchain") || isLlmNode(node) || isVectorNode(node) || isEmbeddingsNode(node);
+}
+
 // ── Custom IdGenerator OpenTelemetry ─────────────────────────────────────────
 let forcedTraceId = null;
 let forcedNextSpanId = null;
@@ -220,12 +250,12 @@ function parseExecution(detail) {
     });
   });
 
+  // 🔹 Tri garanti : L'agent passe toujours AVANT ses sous-nœuds
   nodes.sort((a, b) => {
-    const aIsAgent = a.nodeName.toLowerCase().includes("agent") || (a.nodeType && a.nodeType.includes("agent"));
-    const bIsAgent = b.nodeName.toLowerCase().includes("agent") || (b.nodeType && b.nodeType.includes("agent"));
-
-    const aIsSub = a.nodeName.includes("Model") || a.nodeName.includes("Vector") || a.nodeName.includes("Embeddings");
-    const bIsSub = b.nodeName.includes("Model") || b.nodeName.includes("Vector") || b.nodeName.includes("Embeddings");
+    const aIsAgent = isAgentNode(a);
+    const bIsAgent = isAgentNode(b);
+    const aIsSub = isSubNode(a);
+    const bIsSub = isSubNode(b);
 
     if (aIsAgent && bIsSub) return -1;
     if (bIsAgent && aIsSub) return 1;
@@ -236,7 +266,7 @@ function parseExecution(detail) {
   return { parent, nodes };
 }
 
-// ── Span construction avec attribution des icônes ─────────────────────────────
+// ── Span construction ────────────────────────────────────────────────────────
 function buildAndExportSpans(parsed, traceId) {
   const { parent, nodes } = parsed;
 
@@ -272,26 +302,23 @@ function buildAndExportSpans(parsed, traceId) {
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
     let parentSpanContext = null;
-    const nameLower = node.nodeName.toLowerCase();
-    const typeLower = (node.nodeType || "").toLowerCase();
 
-    const isEmbeddings = nameLower.includes("embedding") || typeLower.includes("embeddings");
-    const isVectorStore = nameLower.includes("vector") || typeLower.includes("vectorstore") || nameLower.includes("pinecone");
-    const isLlmModel = nameLower.includes("model") || typeLower.includes("lm");
-    const isAgent = nameLower.includes("agent") || typeLower.includes("agent");
+    const agentEntry = Array.from(spanContextMap.entries()).find(([name]) => {
+      const targetNode = nodes.find(n => n.nodeName === name);
+      return targetNode && isAgentNode(targetNode);
+    });
 
-    const agentEntry = Array.from(spanContextMap.entries()).find(([name]) => name.toLowerCase().includes("agent"));
-
-    if (isEmbeddings) {
-      const vectorEntry = Array.from(spanContextMap.entries()).find(([name]) =>
-        name.toLowerCase().includes("vector") || name.toLowerCase().includes("pinecone")
-      );
+    if (isEmbeddingsNode(node)) {
+      const vectorEntry = Array.from(spanContextMap.entries()).find(([name]) => {
+        const targetNode = nodes.find(n => n.nodeName === name);
+        return targetNode && isVectorNode(targetNode);
+      });
       if (vectorEntry) {
         parentSpanContext = vectorEntry[1];
       } else if (agentEntry) {
         parentSpanContext = agentEntry[1];
       }
-    } else if (isLlmModel || isVectorStore) {
+    } else if (isLlmNode(node) || isVectorNode(node)) {
       if (agentEntry) {
         parentSpanContext = agentEntry[1];
       }
@@ -305,9 +332,9 @@ function buildAndExportSpans(parsed, traceId) {
       ? trace.setSpan(context.active(), trace.wrapSpanContext(parentSpanContext))
       : rootCtx;
 
-    if (isLlmModel) {
+    if (isLlmNode(node)) {
       forcedNextSpanId = deriveSpanId(traceId + `-chat-${node.runIndex}`);
-    } else if (isEmbeddings) {
+    } else if (isEmbeddingsNode(node)) {
       forcedNextSpanId = deriveSpanId(traceId + `-embeddings-${node.runIndex}`);
     }
 
@@ -317,15 +344,15 @@ function buildAndExportSpans(parsed, traceId) {
       parentCtxToUse
     );
 
-    // 🔹 ATTRIBUTS POUR LES ICÔNES DANS LANGFUSE
-    if (isLlmModel) {
+    // Attributs pour les icônes
+    if (isLlmNode(node)) {
       childSpan.setAttribute("openinference.type", "LLM");
       childSpan.setAttribute("gen_ai.system", "google");
       childSpan.setAttribute("gen_ai.request.model", "gemini-3.5-flash");
-    } else if (isVectorStore || isEmbeddings) {
+    } else if (isVectorNode(node) || isEmbeddingsNode(node)) {
       childSpan.setAttribute("openinference.type", "RETRIEVER");
       childSpan.setAttribute("db.system", "pinecone");
-    } else if (isAgent) {
+    } else if (isAgentNode(node)) {
       childSpan.setAttribute("openinference.type", "AGENT");
     } else {
       childSpan.setAttribute("openinference.type", "CHAIN");
@@ -359,7 +386,6 @@ function buildAndExportSpans(parsed, traceId) {
 }
 
 // ── Public function ──────────────────────────────────────────────────────────
-// ── Public function ──────────────────────────────────────────────────────────
 async function processTraceparentAsync(traceparentHeader) {
   try {
     const parts = traceparentHeader.split("-");
@@ -373,7 +399,6 @@ async function processTraceparentAsync(traceparentHeader) {
     if (!executionId) return;
 
     let detail = null;
-    // 🔹 25 tentatives de 2.5s = jusqu'à 62.5 secondes d'attente max
     for (let attempt = 0; attempt < 25; attempt++) {
       detail = await n8nGet(`/executions/${executionId}?includeData=true`);
       if (detail && detail.stoppedAt) break;
@@ -381,7 +406,7 @@ async function processTraceparentAsync(traceparentHeader) {
     }
 
     if (!detail || !detail.stoppedAt) {
-      console.warn(`[otel] Exécution ${executionId} non terminée après 60s, abandon.`);
+      console.warn(`[otel] Exécution ${executionId} non terminée, abandon.`);
       return;
     }
 
