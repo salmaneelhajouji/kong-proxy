@@ -1,6 +1,5 @@
 const crypto = require("crypto");
 const { trace, context } = require("@opentelemetry/api");
-// 🔹 Remplacement de BatchSpanProcessor par SimpleSpanProcessor pour un envoi immédiat
 const { BasicTracerProvider, SimpleSpanProcessor } = require("@opentelemetry/sdk-trace-node");
 const { OTLPTraceExporter } = require("@opentelemetry/exporter-trace-otlp-http");
 const { Resource } = require("@opentelemetry/resources");
@@ -95,7 +94,6 @@ function setupTracer() {
     idGenerator: customIdGenerator,
   });
 
-  // 🔹 SimpleSpanProcessor envoie chaque span SANS AUCUN DÉLAI
   provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
   provider.register();
 
@@ -124,17 +122,18 @@ async function fetchLatestExecutionId() {
   return latest ? parseInt(latest, 10) : null;
 }
 
+// 🔹 FIX CRITIQUE : Rafraîchissement systématique du dernier execution_id
 async function resolveExecutionIdFromTraceId(traceId) {
-  if (lastKnownExecutionId === null) {
-    try {
-      lastKnownExecutionId = await fetchLatestExecutionId();
-    } catch (e) {
-      console.error(`[otel] Impossible de récupérer le dernier execution_id:`, e.message);
-      return null;
-    }
+  try {
+    const latest = await fetchLatestExecutionId();
+    if (latest) lastKnownExecutionId = latest;
+  } catch (e) {
+    console.error(`[otel] Impossible de rafraîchir le dernier execution_id:`, e.message);
   }
 
-  const upperBound = lastKnownExecutionId + 20;
+  if (!lastKnownExecutionId) return null;
+
+  const upperBound = lastKnownExecutionId + 10;
   const lowerBound = Math.max(1, lastKnownExecutionId - REVERSE_SEARCH_RANGE);
 
   for (let candidate = upperBound; candidate >= lowerBound; candidate--) {
@@ -265,7 +264,6 @@ function parseExecution(detail) {
   return { parent, nodes };
 }
 
-// ── Span construction avec vidage immédiat ───────────────────────────────────
 async function buildAndExportSpans(parsed, traceId) {
   const { parent, nodes } = parsed;
 
@@ -376,7 +374,6 @@ async function buildAndExportSpans(parsed, traceId) {
     childSpan.end(nodeEndMs);
   });
 
-  // 🔹 Force le flush HTTP immédiat vers Langfuse
   if (provider) {
     await provider.forceFlush();
   }
@@ -400,7 +397,7 @@ async function processTraceparentAsync(traceparentHeader) {
     for (let attempt = 0; attempt < 25; attempt++) {
       detail = await n8nGet(`/executions/${executionId}?includeData=true`);
       if (detail && detail.stoppedAt) break;
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 2500));
     }
 
     if (!detail || !detail.stoppedAt) {
