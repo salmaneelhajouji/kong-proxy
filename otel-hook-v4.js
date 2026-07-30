@@ -289,25 +289,54 @@ async function buildAndExportSpans(parsed, traceId) {
   const rootCtx = trace.setSpan(context.active(), rootSpan);
   const spanContextMap = new Map();
 
+  // 🔹 FIX 1 : Détermination de la fin globale maximale de tous les sous-nœuds
+  let maxSubnodeEndMs = endMs;
+  nodes.forEach(n => {
+    const dur = Math.max(n.durationMs || 1, 1);
+    const e = (n.startTimeMs || startMs) + dur;
+    if (e > maxSubnodeEndMs) maxSubnodeEndMs = e;
+  });
+
+  // Pré-calcul de la fin d'Embeddings
+  const embeddingsNode = nodes.find(n => isEmbeddingsNode(n));
+  let embeddingsEndMs = 0;
+  if (embeddingsNode) {
+    embeddingsEndMs = (embeddingsNode.startTimeMs || startMs) + Math.max(embeddingsNode.durationMs || 1, 1);
+  }
+
   nodes.forEach(node => {
     const durationMs = Math.max(node.durationMs || 1, 1);
     let nodeStartMs = node.startTimeMs || startMs;
     let nodeEndMs = nodeStartMs + durationMs;
 
+    // 🔹 FIX 2 : L'Agent reste OUVERT pendant toute la durée des sous-appels
+    if (isAgentNode(node)) {
+      nodeEndMs = maxSubnodeEndMs;
+    }
+    
+    // 🔹 FIX 3 : Pinecone reste OUVERT jusqu'à la fin d'Embeddings
+    if (isVectorNode(node) && embeddingsEndMs > 0) {
+      nodeEndMs = Math.max(nodeEndMs, embeddingsEndMs + 50);
+    }
+
     if (nodeStartMs < startMs) nodeStartMs = startMs;
-    if (nodeEndMs > endMs) nodeEndMs = endMs;
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
     let parentSpanContext = null;
 
-    const agentEntry = Array.from(spanContextMap.entries()).find(([name]) => {
-      const targetNode = nodes.find(n => n.nodeName === name);
+    // Clé unique pour éviter d'écraser les contextes des nœuds de même nom (LLM #1 vs LLM #2)
+    const uniqueNodeKey = `${node.nodeName}_${node.executionIndex}_${node.runIndex}`;
+
+    // Recherche du contexte de l'Agent parent
+    const agentEntry = Array.from(spanContextMap.entries()).find(([key]) => {
+      const targetNode = nodes.find(n => `${n.nodeName}_${n.executionIndex}_${n.runIndex}` === key);
       return targetNode && isAgentNode(targetNode);
     });
 
     if (isEmbeddingsNode(node)) {
-      const vectorEntry = Array.from(spanContextMap.entries()).find(([name]) => {
-        const targetNode = nodes.find(n => n.nodeName === name);
+      // Embeddings se rattache à Pinecone
+      const vectorEntry = Array.from(spanContextMap.entries()).find(([key]) => {
+        const targetNode = nodes.find(n => `${n.nodeName}_${n.executionIndex}_${n.runIndex}` === key);
         return targetNode && isVectorNode(targetNode);
       });
       if (vectorEntry) {
@@ -316,13 +345,20 @@ async function buildAndExportSpans(parsed, traceId) {
         parentSpanContext = agentEntry[1];
       }
     } else if (isLlmNode(node) || isVectorNode(node)) {
+      // Les LLM et Pinecone se rattachent à l'AI Agent
       if (agentEntry) {
         parentSpanContext = agentEntry[1];
       }
     }
 
-    if (!parentSpanContext && node.sourceNode && spanContextMap.has(node.sourceNode)) {
-      parentSpanContext = spanContextMap.get(node.sourceNode);
+    if (!parentSpanContext && node.sourceNode) {
+      const sourceEntry = Array.from(spanContextMap.entries()).find(([key]) => {
+        const targetNode = nodes.find(n => `${n.nodeName}_${n.executionIndex}_${n.runIndex}` === key);
+        return targetNode && targetNode.nodeName === node.sourceNode;
+      });
+      if (sourceEntry) {
+        parentSpanContext = sourceEntry[1];
+      }
     }
 
     const parentCtxToUse = parentSpanContext
@@ -374,12 +410,12 @@ async function buildAndExportSpans(parsed, traceId) {
 
     childSpan.setStatus({ code: toOtelStatusCode(node.status) });
 
-    spanContextMap.set(node.nodeName, childSpan.spanContext());
+    spanContextMap.set(uniqueNodeKey, childSpan.spanContext());
 
     childSpan.end(nodeEndMs);
   });
 
-  rootSpan.end(endMs);
+  rootSpan.end(maxSubnodeEndMs);
 
   if (provider) {
     await provider.forceFlush();
@@ -407,7 +443,6 @@ async function processTraceparentAsync(traceparentHeader) {
 
     let detail = null;
 
-    // 🔹 PING HTTP REGULIER pour garder Render 100% éveillé pendant l'attente n8n
     const renderKeepAliveTimer = setInterval(() => {
       fetch(`${PUBLIC_PROXY_URL}/`).catch(() => {});
     }, 2000);
