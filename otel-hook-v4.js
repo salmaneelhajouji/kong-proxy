@@ -1,6 +1,4 @@
 const crypto = require("crypto");
-const http = require("http");
-const https = require("https");
 const { trace, context } = require("@opentelemetry/api");
 const { BasicTracerProvider, SimpleSpanProcessor } = require("@opentelemetry/sdk-trace-node");
 const { OTLPTraceExporter } = require("@opentelemetry/exporter-trace-otlp-http");
@@ -12,6 +10,7 @@ const N8N_HOST = process.env.N8N_HOST;
 const N8N_API_KEY = process.env.N8N_API_KEY;
 const OTEL_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
 const OTEL_HEADERS_RAW = process.env.OTEL_EXPORTER_OTLP_HEADERS || "";
+const PUBLIC_PROXY_URL = process.env.RENDER_EXTERNAL_URL || "https://kong-proxy.onrender.com";
 const REVERSE_SEARCH_RANGE = parseInt(process.env.REVERSE_SEARCH_RANGE || "300", 10);
 const MAX_ATTR_LENGTH = parseInt(process.env.MAX_ATTR_LENGTH || "8000", 10);
 
@@ -290,13 +289,34 @@ async function buildAndExportSpans(parsed, traceId) {
   const rootCtx = trace.setSpan(context.active(), rootSpan);
   const spanContextMap = new Map();
 
+  // 🔹 FIX : Calcul de la fin globale des sous-nœuds pour garder l'Agent ouvert
+  const maxSubnodeEndMs = nodes.reduce((max, n) => {
+    const dur = Math.max(n.durationMs || 1, 1);
+    const end = (n.startTimeMs || startMs) + dur;
+    return Math.max(max, end);
+  }, endMs);
+
   nodes.forEach(node => {
     const durationMs = Math.max(node.durationMs || 1, 1);
     let nodeStartMs = node.startTimeMs || startMs;
     let nodeEndMs = nodeStartMs + durationMs;
 
+    // Si c'est l'Agent, sa fin englobe TOUS les sous-nœuds jusqu'à la fin de l'exécution
+    if (isAgentNode(node)) {
+      nodeEndMs = maxSubnodeEndMs;
+    }
+    
+    // Si c'est Pinecone, sa fin englobe aussi Embeddings
+    if (isVectorNode(node)) {
+      const embeddingsNode = nodes.find(n => isEmbeddingsNode(n));
+      if (embeddingsNode) {
+        const embEnd = (embeddingsNode.startTimeMs || startMs) + Math.max(embeddingsNode.durationMs || 1, 1);
+        nodeEndMs = Math.max(nodeEndMs, embEnd + 100);
+      }
+    }
+
     if (nodeStartMs < startMs) nodeStartMs = startMs;
-    if (nodeEndMs > endMs) nodeEndMs = endMs;
+    if (nodeEndMs > maxSubnodeEndMs) nodeEndMs = maxSubnodeEndMs;
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
     let parentSpanContext = null;
@@ -380,7 +400,7 @@ async function buildAndExportSpans(parsed, traceId) {
     childSpan.end(nodeEndMs);
   });
 
-  rootSpan.end(endMs);
+  rootSpan.end(maxSubnodeEndMs);
 
   if (provider) {
     await provider.forceFlush();
@@ -407,26 +427,27 @@ async function processTraceparentAsync(traceparentHeader) {
     console.log(`[otel] Attente active de la fin de l'exécution n8n #${executionId}...`);
 
     let detail = null;
-    
-    // 🔹 Maintient le processeur Render éveillé pendant la scrutation
-    const keepAliveTimer = setInterval(() => {
-      // Activité CPU minimale pour empêcher Render de geler l'Event Loop
-    }, 500);
 
-    for (let attempt = 0; attempt < 45; attempt++) {
-      try {
-        detail = await n8nGet(`/executions/${executionId}?includeData=true`);
-        if (detail && detail.stoppedAt) break;
-      } catch (e) {
-        // Attente pendant que n8n exécute le workflow
+    const renderKeepAliveTimer = setInterval(() => {
+      fetch(`${PUBLIC_PROXY_URL}/`).catch(() => {});
+    }, 2000);
+
+    try {
+      for (let attempt = 0; attempt < 40; attempt++) {
+        try {
+          detail = await n8nGet(`/executions/${executionId}?includeData=true`);
+          if (detail && detail.stoppedAt) break;
+        } catch (e) {
+          // Attente pendant l'exécution n8n
+        }
+        await new Promise(r => setTimeout(r, 1500));
       }
-      await new Promise(r => setTimeout(r, 1000)); // Scrutation toutes les 1s
+    } finally {
+      clearInterval(renderKeepAliveTimer);
     }
 
-    clearInterval(keepAliveTimer);
-
     if (!detail || !detail.stoppedAt) {
-      console.warn(`[otel] Exécution ${executionId} non terminée après 45s, abandon.`);
+      console.warn(`[otel] Exécution ${executionId} non terminée après 60s, abandon.`);
       return;
     }
 
