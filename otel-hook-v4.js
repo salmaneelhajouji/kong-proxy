@@ -1,4 +1,6 @@
 const crypto = require("crypto");
+const http = require("http");
+const https = require("https");
 const { trace, context } = require("@opentelemetry/api");
 const { BasicTracerProvider, SimpleSpanProcessor } = require("@opentelemetry/sdk-trace-node");
 const { OTLPTraceExporter } = require("@opentelemetry/exporter-trace-otlp-http");
@@ -269,7 +271,6 @@ async function buildAndExportSpans(parsed, traceId) {
   const startMs = Date.parse(parent.startedAt);
   const endMs = Date.parse(parent.stoppedAt);
 
-  // 🔹 VRAI ROOT SPAN EXPORTÉ
   forcedTraceId = traceId;
   const rootSpan = tracer.startSpan(
     `n8n.${parent.workflowName}`,
@@ -403,21 +404,29 @@ async function processTraceparentAsync(traceparentHeader) {
       return;
     }
 
-    console.log(`[otel] Attente de la fin de l'exécution n8n #${executionId}...`);
+    console.log(`[otel] Attente active de la fin de l'exécution n8n #${executionId}...`);
 
     let detail = null;
-    for (let attempt = 0; attempt < 30; attempt++) {
+    
+    // 🔹 Maintient le processeur Render éveillé pendant la scrutation
+    const keepAliveTimer = setInterval(() => {
+      // Activité CPU minimale pour empêcher Render de geler l'Event Loop
+    }, 500);
+
+    for (let attempt = 0; attempt < 45; attempt++) {
       try {
         detail = await n8nGet(`/executions/${executionId}?includeData=true`);
         if (detail && detail.stoppedAt) break;
       } catch (e) {
-        // Attente pendant l'exécution sans lever d'exception
+        // Attente pendant que n8n exécute le workflow
       }
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 1000)); // Scrutation toutes les 1s
     }
 
+    clearInterval(keepAliveTimer);
+
     if (!detail || !detail.stoppedAt) {
-      console.warn(`[otel] Exécution ${executionId} non terminée, abandon.`);
+      console.warn(`[otel] Exécution ${executionId} non terminée après 45s, abandon.`);
       return;
     }
 
