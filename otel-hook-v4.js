@@ -122,7 +122,6 @@ async function fetchLatestExecutionId() {
   return latest ? parseInt(latest, 10) : null;
 }
 
-// 🔹 FIX CRITIQUE : Rafraîchissement systématique du dernier execution_id
 async function resolveExecutionIdFromTraceId(traceId) {
   try {
     const latest = await fetchLatestExecutionId();
@@ -133,7 +132,7 @@ async function resolveExecutionIdFromTraceId(traceId) {
 
   if (!lastKnownExecutionId) return null;
 
-  const upperBound = lastKnownExecutionId + 10;
+  const upperBound = lastKnownExecutionId + 20;
   const lowerBound = Math.max(1, lastKnownExecutionId - REVERSE_SEARCH_RANGE);
 
   for (let candidate = upperBound; candidate >= lowerBound; candidate--) {
@@ -270,18 +269,24 @@ async function buildAndExportSpans(parsed, traceId) {
   const startMs = Date.parse(parent.startedAt);
   const endMs = Date.parse(parent.stoppedAt);
 
+  // 🔹 FIX : On force le traceId et on crée un VRAI Span Racine valide
   forcedTraceId = traceId;
+  const rootSpan = tracer.startSpan(
+    `n8n.${parent.workflowName}`,
+    { startTime: startMs }
+  );
 
-  const fakeSpanContext = {
-    traceId,
-    spanId: deriveSpanId(parent.executionId),
-    traceFlags: 1,
-    isRemote: true,
-  };
+  rootSpan.setAttribute("n8n.execution.id", parent.executionId);
+  rootSpan.setAttribute("n8n.execution.status", parent.status);
+  rootSpan.setAttribute("n8n.execution.mode", parent.mode);
+  rootSpan.setAttribute("n8n.workflow.id", parent.workflowId);
+  rootSpan.setAttribute("n8n.workflow.name", parent.workflowName);
+  if (parent.retryOf) rootSpan.setAttribute("n8n.execution.retry_of", String(parent.retryOf));
+  if (parent.errorMessage) rootSpan.setAttribute("n8n.execution.error.message", parent.errorMessage);
+  if (parent.errorNode) rootSpan.setAttribute("n8n.execution.error.node", parent.errorNode);
+  rootSpan.setStatus({ code: toOtelStatusCode(parent.status) });
 
-  const fakeParentSpan = trace.wrapSpanContext(fakeSpanContext);
-  const rootCtx = trace.setSpan(context.active(), fakeParentSpan);
-
+  const rootCtx = trace.setSpan(context.active(), rootSpan);
   const spanContextMap = new Map();
 
   nodes.forEach(node => {
@@ -374,6 +379,8 @@ async function buildAndExportSpans(parsed, traceId) {
     childSpan.end(nodeEndMs);
   });
 
+  rootSpan.end(endMs);
+
   if (provider) {
     await provider.forceFlush();
   }
@@ -391,13 +398,22 @@ async function processTraceparentAsync(traceparentHeader) {
     const traceId = parts[1];
 
     const executionId = await resolveExecutionIdFromTraceId(traceId);
-    if (!executionId) return;
+    if (!executionId) {
+      console.warn(`[otel] Impossible de résoudre execution_id pour trace_id=${traceId}`);
+      return;
+    }
+
+    console.log(`[otel] Attente de la fin de l'exécution n8n #${executionId}...`);
 
     let detail = null;
-    for (let attempt = 0; attempt < 25; attempt++) {
-      detail = await n8nGet(`/executions/${executionId}?includeData=true`);
-      if (detail && detail.stoppedAt) break;
-      await new Promise(r => setTimeout(r, 2500));
+    for (let attempt = 0; attempt < 30; attempt++) {
+      try {
+        detail = await n8nGet(`/executions/${executionId}?includeData=true`);
+        if (detail && detail.stoppedAt) break;
+      } catch (e) {
+        // Attente pendant l'exécution sans lever d'exception
+      }
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     if (!detail || !detail.stoppedAt) {
