@@ -26,33 +26,36 @@ function parseHeaders(raw) {
   return result;
 }
 
-function isAgentNode(node) {
-  const t = (node.nodeType || "").toLowerCase();
-  const n = (node.nodeName || "").toLowerCase();
-  return t.includes("agent") || n.includes("agent");
-}
-
-function isLlmNode(node) {
-  const t = (node.nodeType || "").toLowerCase();
-  const n = (node.nodeName || "").toLowerCase();
-  return t.includes("lmchat") || t.includes("openai") || n.includes("llm") || n.includes("model");
-}
-
-function isVectorNode(node) {
-  const t = (node.nodeType || "").toLowerCase();
-  const n = (node.nodeName || "").toLowerCase();
-  return t.includes("vector") || t.includes("pinecone") || n.includes("vector") || n.includes("pinecone");
-}
-
+// ── Détecteurs mutuellement exclusifs (FIX CRITIQUE) ─────────────────────────
 function isEmbeddingsNode(node) {
   const t = (node.nodeType || "").toLowerCase();
   const n = (node.nodeName || "").toLowerCase();
   return t.includes("embedding") || n.includes("embedding");
 }
 
-function isSubNode(node) {
+function isVectorNode(node) {
+  if (isEmbeddingsNode(node)) return false;
   const t = (node.nodeType || "").toLowerCase();
-  return t.includes("@n8n/n8n-nodes-langchain") || isLlmNode(node) || isVectorNode(node) || isEmbeddingsNode(node);
+  const n = (node.nodeName || "").toLowerCase();
+  return t.includes("vector") || t.includes("pinecone") || n.includes("vector") || n.includes("pinecone");
+}
+
+function isLlmNode(node) {
+  if (isEmbeddingsNode(node) || isVectorNode(node)) return false;
+  const t = (node.nodeType || "").toLowerCase();
+  const n = (node.nodeName || "").toLowerCase();
+  return t.includes("lmchat") || t.includes("lmopenai") || n.includes("llm") || n.includes("model");
+}
+
+function isAgentNode(node) {
+  if (isEmbeddingsNode(node) || isVectorNode(node) || isLlmNode(node)) return false;
+  const t = (node.nodeType || "").toLowerCase();
+  const n = (node.nodeName || "").toLowerCase();
+  return t.includes("agent") || n.includes("agent");
+}
+
+function isSubNode(node) {
+  return isEmbeddingsNode(node) || isVectorNode(node) || isLlmNode(node);
 }
 
 let forcedTraceId = null;
@@ -289,7 +292,6 @@ async function buildAndExportSpans(parsed, traceId) {
   const rootCtx = trace.setSpan(context.active(), rootSpan);
   const spanContextMap = new Map();
 
-  // 🔹 FIX 1 : Détermination de la fin globale maximale de tous les sous-nœuds
   let maxSubnodeEndMs = endMs;
   nodes.forEach(n => {
     const dur = Math.max(n.durationMs || 1, 1);
@@ -297,7 +299,6 @@ async function buildAndExportSpans(parsed, traceId) {
     if (e > maxSubnodeEndMs) maxSubnodeEndMs = e;
   });
 
-  // Pré-calcul de la fin d'Embeddings
   const embeddingsNode = nodes.find(n => isEmbeddingsNode(n));
   let embeddingsEndMs = 0;
   if (embeddingsNode) {
@@ -309,12 +310,10 @@ async function buildAndExportSpans(parsed, traceId) {
     let nodeStartMs = node.startTimeMs || startMs;
     let nodeEndMs = nodeStartMs + durationMs;
 
-    // 🔹 FIX 2 : L'Agent reste OUVERT pendant toute la durée des sous-appels
     if (isAgentNode(node)) {
       nodeEndMs = maxSubnodeEndMs;
     }
     
-    // 🔹 FIX 3 : Pinecone reste OUVERT jusqu'à la fin d'Embeddings
     if (isVectorNode(node) && embeddingsEndMs > 0) {
       nodeEndMs = Math.max(nodeEndMs, embeddingsEndMs + 50);
     }
@@ -323,18 +322,14 @@ async function buildAndExportSpans(parsed, traceId) {
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
     let parentSpanContext = null;
-
-    // Clé unique pour éviter d'écraser les contextes des nœuds de même nom (LLM #1 vs LLM #2)
     const uniqueNodeKey = `${node.nodeName}_${node.executionIndex}_${node.runIndex}`;
 
-    // Recherche du contexte de l'Agent parent
     const agentEntry = Array.from(spanContextMap.entries()).find(([key]) => {
       const targetNode = nodes.find(n => `${n.nodeName}_${n.executionIndex}_${n.runIndex}` === key);
       return targetNode && isAgentNode(targetNode);
     });
 
     if (isEmbeddingsNode(node)) {
-      // Embeddings se rattache à Pinecone
       const vectorEntry = Array.from(spanContextMap.entries()).find(([key]) => {
         const targetNode = nodes.find(n => `${n.nodeName}_${n.executionIndex}_${n.runIndex}` === key);
         return targetNode && isVectorNode(targetNode);
@@ -345,7 +340,6 @@ async function buildAndExportSpans(parsed, traceId) {
         parentSpanContext = agentEntry[1];
       }
     } else if (isLlmNode(node) || isVectorNode(node)) {
-      // Les LLM et Pinecone se rattachent à l'AI Agent
       if (agentEntry) {
         parentSpanContext = agentEntry[1];
       }
