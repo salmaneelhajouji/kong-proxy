@@ -289,34 +289,13 @@ async function buildAndExportSpans(parsed, traceId) {
   const rootCtx = trace.setSpan(context.active(), rootSpan);
   const spanContextMap = new Map();
 
-  // 🔹 FIX : Calcul de la fin globale des sous-nœuds pour garder l'Agent ouvert
-  const maxSubnodeEndMs = nodes.reduce((max, n) => {
-    const dur = Math.max(n.durationMs || 1, 1);
-    const end = (n.startTimeMs || startMs) + dur;
-    return Math.max(max, end);
-  }, endMs);
-
   nodes.forEach(node => {
     const durationMs = Math.max(node.durationMs || 1, 1);
     let nodeStartMs = node.startTimeMs || startMs;
     let nodeEndMs = nodeStartMs + durationMs;
 
-    // Si c'est l'Agent, sa fin englobe TOUS les sous-nœuds jusqu'à la fin de l'exécution
-    if (isAgentNode(node)) {
-      nodeEndMs = maxSubnodeEndMs;
-    }
-    
-    // Si c'est Pinecone, sa fin englobe aussi Embeddings
-    if (isVectorNode(node)) {
-      const embeddingsNode = nodes.find(n => isEmbeddingsNode(n));
-      if (embeddingsNode) {
-        const embEnd = (embeddingsNode.startTimeMs || startMs) + Math.max(embeddingsNode.durationMs || 1, 1);
-        nodeEndMs = Math.max(nodeEndMs, embEnd + 100);
-      }
-    }
-
     if (nodeStartMs < startMs) nodeStartMs = startMs;
-    if (nodeEndMs > maxSubnodeEndMs) nodeEndMs = maxSubnodeEndMs;
+    if (nodeEndMs > endMs) nodeEndMs = endMs;
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
     let parentSpanContext = null;
@@ -400,7 +379,7 @@ async function buildAndExportSpans(parsed, traceId) {
     childSpan.end(nodeEndMs);
   });
 
-  rootSpan.end(maxSubnodeEndMs);
+  rootSpan.end(endMs);
 
   if (provider) {
     await provider.forceFlush();
@@ -428,6 +407,7 @@ async function processTraceparentAsync(traceparentHeader) {
 
     let detail = null;
 
+    // 🔹 PING HTTP REGULIER pour garder Render 100% éveillé pendant l'attente n8n
     const renderKeepAliveTimer = setInterval(() => {
       fetch(`${PUBLIC_PROXY_URL}/`).catch(() => {});
     }, 2000);
