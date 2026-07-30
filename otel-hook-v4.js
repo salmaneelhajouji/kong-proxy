@@ -269,7 +269,7 @@ async function buildAndExportSpans(parsed, traceId) {
   const startMs = Date.parse(parent.startedAt);
   const endMs = Date.parse(parent.stoppedAt);
 
-  // 🔹 FIX : On force le traceId et on crée un VRAI Span Racine valide
+  // 🔹 VRAI ROOT SPAN EXPORTÉ
   forcedTraceId = traceId;
   const rootSpan = tracer.startSpan(
     `n8n.${parent.workflowName}`,
