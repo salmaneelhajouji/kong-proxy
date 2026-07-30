@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const { trace, context } = require("@opentelemetry/api");
-const { BasicTracerProvider, BatchSpanProcessor } = require("@opentelemetry/sdk-trace-node");
+// 🔹 Remplacement de BatchSpanProcessor par SimpleSpanProcessor pour un envoi immédiat
+const { BasicTracerProvider, SimpleSpanProcessor } = require("@opentelemetry/sdk-trace-node");
 const { OTLPTraceExporter } = require("@opentelemetry/exporter-trace-otlp-http");
 const { Resource } = require("@opentelemetry/resources");
 const { SemanticResourceAttributes } = require("@opentelemetry/semantic-conventions");
@@ -25,7 +26,6 @@ function parseHeaders(raw) {
   return result;
 }
 
-// ── Détecteurs de type de nœud ───────────────────────────────────────────────
 function isAgentNode(node) {
   const t = (node.nodeType || "").toLowerCase();
   const n = (node.nodeName || "").toLowerCase();
@@ -55,7 +55,6 @@ function isSubNode(node) {
   return t.includes("@n8n/n8n-nodes-langchain") || isLlmNode(node) || isVectorNode(node) || isEmbeddingsNode(node);
 }
 
-// ── Custom IdGenerator OpenTelemetry ─────────────────────────────────────────
 let forcedTraceId = null;
 let forcedNextSpanId = null;
 
@@ -79,6 +78,7 @@ const customIdGenerator = {
 };
 
 let tracer = null;
+let provider = null;
 
 function setupTracer() {
   const resource = new Resource({
@@ -90,16 +90,17 @@ function setupTracer() {
     headers: parseHeaders(OTEL_HEADERS_RAW),
   });
 
-  const provider = new BasicTracerProvider({
+  provider = new BasicTracerProvider({
     resource,
     idGenerator: customIdGenerator,
   });
 
-  provider.addSpanProcessor(new BatchSpanProcessor(exporter));
+  // 🔹 SimpleSpanProcessor envoie chaque span SANS AUCUN DÉLAI
+  provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
   provider.register();
 
   tracer = trace.getTracer("n8n-webhook-hook");
-  console.log(`[otel] Tracer initialisé -> ${OTEL_ENDPOINT}`);
+  console.log(`[otel] Tracer initialisé (Mode Instantané) -> ${OTEL_ENDPOINT}`);
 }
 
 function deriveTraceId(seed) {
@@ -110,7 +111,6 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// ── Reverse lookup: trace_id -> execution_id ─────────────────────────────────
 let lastKnownExecutionId = null;
 
 async function fetchLatestExecutionId() {
@@ -265,8 +265,8 @@ function parseExecution(detail) {
   return { parent, nodes };
 }
 
-// ── Span construction sans wrapper redondant ─────────────────────────────────
-function buildAndExportSpans(parsed, traceId) {
+// ── Span construction avec vidage immédiat ───────────────────────────────────
+async function buildAndExportSpans(parsed, traceId) {
   const { parent, nodes } = parsed;
 
   const startMs = Date.parse(parent.startedAt);
@@ -274,7 +274,6 @@ function buildAndExportSpans(parsed, traceId) {
 
   forcedTraceId = traceId;
 
-  // Contexte de la trace racine (sans créer de span physique superflue)
   const fakeSpanContext = {
     traceId,
     spanId: deriveSpanId(parent.executionId),
@@ -339,7 +338,6 @@ function buildAndExportSpans(parsed, traceId) {
       parentCtxToUse
     );
 
-    // Attributs pour les icônes
     if (isLlmNode(node)) {
       childSpan.setAttribute("openinference.type", "LLM");
       childSpan.setAttribute("gen_ai.system", "google");
@@ -378,10 +376,14 @@ function buildAndExportSpans(parsed, traceId) {
     childSpan.end(nodeEndMs);
   });
 
-  console.log(`[otel] Exportation réussie pour [${parent.executionId}] trace_id=${traceId}`);
+  // 🔹 Force le flush HTTP immédiat vers Langfuse
+  if (provider) {
+    await provider.forceFlush();
+  }
+
+  console.log(`[otel] Exportation instantanée réussie pour [${parent.executionId}] trace_id=${traceId}`);
 }
 
-// ── Public function ──────────────────────────────────────────────────────────
 async function processTraceparentAsync(traceparentHeader) {
   try {
     const parts = traceparentHeader.split("-");
@@ -398,7 +400,7 @@ async function processTraceparentAsync(traceparentHeader) {
     for (let attempt = 0; attempt < 25; attempt++) {
       detail = await n8nGet(`/executions/${executionId}?includeData=true`);
       if (detail && detail.stoppedAt) break;
-      await new Promise(r => setTimeout(r, 2500));
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     if (!detail || !detail.stoppedAt) {
@@ -407,7 +409,7 @@ async function processTraceparentAsync(traceparentHeader) {
     }
 
     const parsed = parseExecution(detail);
-    buildAndExportSpans(parsed, traceId);
+    await buildAndExportSpans(parsed, traceId);
 
   } catch (e) {
     console.error(`[otel] Erreur lors du traitement du traceparent ${traceparentHeader}:`, e.message);
