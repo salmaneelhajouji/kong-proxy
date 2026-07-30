@@ -25,7 +25,7 @@ function parseHeaders(raw) {
   return result;
 }
 
-// ── Détecteurs robustes basés sur le Type ET le Nom ─────────────────────────
+// ── Détecteurs de type de nœud ───────────────────────────────────────────────
 function isAgentNode(node) {
   const t = (node.nodeType || "").toLowerCase();
   const n = (node.nodeName || "").toLowerCase();
@@ -250,7 +250,6 @@ function parseExecution(detail) {
     });
   });
 
-  // 🔹 Tri garanti : L'agent passe toujours AVANT ses sous-nœuds
   nodes.sort((a, b) => {
     const aIsAgent = isAgentNode(a);
     const bIsAgent = isAgentNode(b);
@@ -266,7 +265,7 @@ function parseExecution(detail) {
   return { parent, nodes };
 }
 
-// ── Span construction ────────────────────────────────────────────────────────
+// ── Span construction sans wrapper redondant ─────────────────────────────────
 function buildAndExportSpans(parsed, traceId) {
   const { parent, nodes } = parsed;
 
@@ -274,22 +273,18 @@ function buildAndExportSpans(parsed, traceId) {
   const endMs = Date.parse(parent.stoppedAt);
 
   forcedTraceId = traceId;
-  const rootSpan = tracer.startSpan(
-    `n8n.${parent.workflowName}`,
-    { startTime: startMs }
-  );
 
-  rootSpan.setAttribute("n8n.execution.id", parent.executionId);
-  rootSpan.setAttribute("n8n.execution.status", parent.status);
-  rootSpan.setAttribute("n8n.execution.mode", parent.mode);
-  rootSpan.setAttribute("n8n.workflow.id", parent.workflowId);
-  rootSpan.setAttribute("n8n.workflow.name", parent.workflowName);
-  if (parent.retryOf) rootSpan.setAttribute("n8n.execution.retry_of", String(parent.retryOf));
-  if (parent.errorMessage) rootSpan.setAttribute("n8n.execution.error.message", parent.errorMessage);
-  if (parent.errorNode) rootSpan.setAttribute("n8n.execution.error.node", parent.errorNode);
-  rootSpan.setStatus({ code: toOtelStatusCode(parent.status) });
+  // Contexte de la trace racine (sans créer de span physique superflue)
+  const fakeSpanContext = {
+    traceId,
+    spanId: deriveSpanId(parent.executionId),
+    traceFlags: 1,
+    isRemote: true,
+  };
 
-  const rootCtx = trace.setSpan(context.active(), rootSpan);
+  const fakeParentSpan = trace.wrapSpanContext(fakeSpanContext);
+  const rootCtx = trace.setSpan(context.active(), fakeParentSpan);
+
   const spanContextMap = new Map();
 
   nodes.forEach(node => {
@@ -358,6 +353,9 @@ function buildAndExportSpans(parsed, traceId) {
       childSpan.setAttribute("openinference.type", "CHAIN");
     }
 
+    childSpan.setAttribute("n8n.execution.id", parent.executionId);
+    childSpan.setAttribute("n8n.workflow.id", parent.workflowId);
+    childSpan.setAttribute("n8n.workflow.name", parent.workflowName);
     childSpan.setAttribute("n8n.node.name", node.nodeName);
     childSpan.setAttribute("n8n.node.type", node.nodeType || "unknown");
     childSpan.setAttribute("n8n.node.status", node.status || "unknown");
@@ -379,8 +377,6 @@ function buildAndExportSpans(parsed, traceId) {
 
     childSpan.end(nodeEndMs);
   });
-
-  rootSpan.end(endMs);
 
   console.log(`[otel] Exportation réussie pour [${parent.executionId}] trace_id=${traceId}`);
 }
