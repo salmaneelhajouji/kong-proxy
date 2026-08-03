@@ -26,7 +26,7 @@ function parseHeaders(raw) {
   return result;
 }
 
-// ── Détecteurs mutuellement exclusifs (FIX CRITIQUE) ─────────────────────────
+// ── Détecteurs mutuellement exclusifs ─────────────────────────────────────────
 function isEmbeddingsNode(node) {
   const t = (node.nodeType || "").toLowerCase();
   const n = (node.nodeName || "").toLowerCase();
@@ -102,7 +102,7 @@ function setupTracer() {
   provider.register();
 
   tracer = trace.getTracer("n8n-webhook-hook");
-  console.log(`[otel] Tracer initialisé (Mode Instantané) -> ${OTEL_ENDPOINT}`);
+  console.log(`[otel] Tracer initialisé (Mode Multi-Workflow Instantané) -> ${OTEL_ENDPOINT}`);
 }
 
 function deriveTraceId(seed) {
@@ -146,7 +146,7 @@ async function resolveExecutionIdFromTraceId(traceId) {
     }
   }
 
-  console.warn(`[otel] Aucun execution_id trouvé pour trace_id=${traceId} dans la plage [${lowerBound}, ${upperBound}]`);
+  console.warn(`[otel] Aucun execution_id trouvé pour trace_id=${traceId}`);
   return null;
 }
 
@@ -248,70 +248,76 @@ function parseExecution(detail) {
         sourceNode: nodeRun.source?.[0]?.previousNode || null,
         inputData,
         outputData,
+        executionId: String(detail.id),
+        workflowName: detail.workflowData?.name || "unknown-workflow"
       });
     });
-  });
-
-  nodes.sort((a, b) => {
-    const aIsAgent = isAgentNode(a);
-    const bIsAgent = isAgentNode(b);
-    const aIsSub = isSubNode(a);
-    const bIsSub = isSubNode(b);
-
-    if (aIsAgent && bIsSub) return -1;
-    if (bIsAgent && aIsSub) return 1;
-
-    return (a.startTimeMs || 0) - (b.startTimeMs || 0) || (a.executionIndex || 0) - (b.executionIndex || 0);
   });
 
   return { parent, nodes };
 }
 
-async function buildAndExportSpans(parsed, traceId) {
-  const { parent, nodes } = parsed;
+// 🔹 Attente active de la fin d'une exécution n8n
+async function waitForExecutionToFinish(executionId, maxAttempts = 40) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const detail = await n8nGet(`/executions/${executionId}?includeData=true`);
+      if (detail && detail.stoppedAt) return detail;
+    } catch (e) {}
+    await new Promise(r => setTimeout(r, 1200));
+  }
+  return null;
+}
 
-  const startMs = Date.parse(parent.startedAt);
-  const endMs = Date.parse(parent.stoppedAt);
+// 🔹 Export unifié de toutes les exécutions (Parent + Sous-workflows)
+async function buildAndExportUnifiedSpans(allParsed, traceId) {
+  const mainParsed = allParsed[0];
+  const { parent: mainParent } = mainParsed;
+
+  const allNodes = [];
+  allParsed.forEach(parsed => {
+    allNodes.push(...parsed.nodes);
+  });
+
+  allNodes.sort((a, b) => (a.startTimeMs || 0) - (b.startTimeMs || 0));
+
+  const startMs = Date.parse(mainParent.startedAt);
+  let maxEndMs = Date.parse(mainParent.stoppedAt);
+
+  allNodes.forEach(n => {
+    const end = (n.startTimeMs || startMs) + Math.max(n.durationMs || 1, 1);
+    if (end > maxEndMs) maxEndMs = end;
+  });
 
   forcedTraceId = traceId;
   const rootSpan = tracer.startSpan(
-    `n8n.${parent.workflowName}`,
+    `n8n.${mainParent.workflowName}`,
     { startTime: startMs }
   );
 
-  rootSpan.setAttribute("n8n.execution.id", parent.executionId);
-  rootSpan.setAttribute("n8n.execution.status", parent.status);
-  rootSpan.setAttribute("n8n.execution.mode", parent.mode);
-  rootSpan.setAttribute("n8n.workflow.id", parent.workflowId);
-  rootSpan.setAttribute("n8n.workflow.name", parent.workflowName);
-  if (parent.retryOf) rootSpan.setAttribute("n8n.execution.retry_of", String(parent.retryOf));
-  if (parent.errorMessage) rootSpan.setAttribute("n8n.execution.error.message", parent.errorMessage);
-  if (parent.errorNode) rootSpan.setAttribute("n8n.execution.error.node", parent.errorNode);
-  rootSpan.setStatus({ code: toOtelStatusCode(parent.status) });
+  rootSpan.setAttribute("n8n.execution.id", mainParent.executionId);
+  rootSpan.setAttribute("n8n.execution.status", mainParent.status);
+  rootSpan.setAttribute("n8n.execution.mode", mainParent.mode);
+  rootSpan.setAttribute("n8n.workflow.id", mainParent.workflowId);
+  rootSpan.setAttribute("n8n.workflow.name", mainParent.workflowName);
+  rootSpan.setStatus({ code: toOtelStatusCode(mainParent.status) });
 
   const rootCtx = trace.setSpan(context.active(), rootSpan);
   const spanContextMap = new Map();
 
-  let maxSubnodeEndMs = endMs;
-  nodes.forEach(n => {
-    const dur = Math.max(n.durationMs || 1, 1);
-    const e = (n.startTimeMs || startMs) + dur;
-    if (e > maxSubnodeEndMs) maxSubnodeEndMs = e;
-  });
-
-  const embeddingsNode = nodes.find(n => isEmbeddingsNode(n));
+  const embeddingsNode = allNodes.find(n => isEmbeddingsNode(n));
   let embeddingsEndMs = 0;
   if (embeddingsNode) {
     embeddingsEndMs = (embeddingsNode.startTimeMs || startMs) + Math.max(embeddingsNode.durationMs || 1, 1);
   }
 
-  nodes.forEach(node => {
+  allNodes.forEach(node => {
     const durationMs = Math.max(node.durationMs || 1, 1);
     let nodeStartMs = node.startTimeMs || startMs;
     let nodeEndMs = nodeStartMs + durationMs;
 
     if (isAgentNode(node)) {
-      nodeEndMs = maxSubnodeEndMs;
+      nodeEndMs = maxEndMs;
     }
     
     if (isVectorNode(node) && embeddingsEndMs > 0) {
@@ -322,37 +328,23 @@ async function buildAndExportSpans(parsed, traceId) {
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
     let parentSpanContext = null;
-    const uniqueNodeKey = `${node.nodeName}_${node.executionIndex}_${node.runIndex}`;
+    const uniqueNodeKey = `${node.workflowName}_${node.nodeName}_${node.executionIndex}_${node.runIndex}`;
 
     const agentEntry = Array.from(spanContextMap.entries()).find(([key]) => {
-      const targetNode = nodes.find(n => `${n.nodeName}_${n.executionIndex}_${n.runIndex}` === key);
-      return targetNode && isAgentNode(targetNode);
+      return key.includes("Agent") || key.includes("agent");
     });
 
     if (isEmbeddingsNode(node)) {
-      const vectorEntry = Array.from(spanContextMap.entries()).find(([key]) => {
-        const targetNode = nodes.find(n => `${n.nodeName}_${n.executionIndex}_${n.runIndex}` === key);
-        return targetNode && isVectorNode(targetNode);
-      });
-      if (vectorEntry) {
-        parentSpanContext = vectorEntry[1];
-      } else if (agentEntry) {
-        parentSpanContext = agentEntry[1];
-      }
+      const vectorEntry = Array.from(spanContextMap.entries()).find(([key]) => key.includes("Vector") || key.includes("Pinecone"));
+      if (vectorEntry) parentSpanContext = vectorEntry[1];
+      else if (agentEntry) parentSpanContext = agentEntry[1];
     } else if (isLlmNode(node) || isVectorNode(node)) {
-      if (agentEntry) {
-        parentSpanContext = agentEntry[1];
-      }
+      if (agentEntry) parentSpanContext = agentEntry[1];
     }
 
     if (!parentSpanContext && node.sourceNode) {
-      const sourceEntry = Array.from(spanContextMap.entries()).find(([key]) => {
-        const targetNode = nodes.find(n => `${n.nodeName}_${n.executionIndex}_${n.runIndex}` === key);
-        return targetNode && targetNode.nodeName === node.sourceNode;
-      });
-      if (sourceEntry) {
-        parentSpanContext = sourceEntry[1];
-      }
+      const sourceEntry = Array.from(spanContextMap.entries()).find(([key]) => key.includes(`_${node.sourceNode}_`));
+      if (sourceEntry) parentSpanContext = sourceEntry[1];
     }
 
     const parentCtxToUse = parentSpanContext
@@ -384,84 +376,75 @@ async function buildAndExportSpans(parsed, traceId) {
       childSpan.setAttribute("openinference.type", "CHAIN");
     }
 
-    childSpan.setAttribute("n8n.execution.id", parent.executionId);
-    childSpan.setAttribute("n8n.workflow.id", parent.workflowId);
-    childSpan.setAttribute("n8n.workflow.name", parent.workflowName);
+    childSpan.setAttribute("n8n.execution.id", node.executionId);
+    childSpan.setAttribute("n8n.workflow.name", node.workflowName);
     childSpan.setAttribute("n8n.node.name", node.nodeName);
     childSpan.setAttribute("n8n.node.type", node.nodeType || "unknown");
     childSpan.setAttribute("n8n.node.status", node.status || "unknown");
     childSpan.setAttribute("n8n.node.duration_ms", durationMs);
-    childSpan.setAttribute("n8n.node.execution_index", node.executionIndex || 0);
-    childSpan.setAttribute("n8n.node.run_index", node.runIndex || 0);
-    if (node.sourceNode) childSpan.setAttribute("n8n.node.source", node.sourceNode);
 
-    if (node.inputData) {
-      childSpan.setAttribute("input.value", truncate(node.inputData));
-    }
-    if (node.outputData) {
-      childSpan.setAttribute("output.value", truncate(node.outputData));
-    }
+    if (node.inputData) childSpan.setAttribute("input.value", truncate(node.inputData));
+    if (node.outputData) childSpan.setAttribute("output.value", truncate(node.outputData));
 
     childSpan.setStatus({ code: toOtelStatusCode(node.status) });
-
     spanContextMap.set(uniqueNodeKey, childSpan.spanContext());
 
     childSpan.end(nodeEndMs);
   });
 
-  rootSpan.end(maxSubnodeEndMs);
+  rootSpan.end(maxEndMs);
 
-  if (provider) {
-    await provider.forceFlush();
-  }
-
-  console.log(`[otel] Exportation instantanée réussie pour [${parent.executionId}] trace_id=${traceId}`);
+  if (provider) await provider.forceFlush();
+  console.log(`[otel] Export unifié réussi pour [Parent #${mainParent.executionId}] avec ${allParsed.length} workflows liés | trace_id=${traceId}`);
 }
 
 async function processTraceparentAsync(traceparentHeader) {
   try {
     const parts = traceparentHeader.split("-");
-    if (parts.length < 4) {
-      console.warn(`[otel] traceparent malformé: ${traceparentHeader}`);
-      return;
-    }
+    if (parts.length < 4) return;
     const traceId = parts[1];
 
-    const executionId = await resolveExecutionIdFromTraceId(traceId);
-    if (!executionId) {
-      console.warn(`[otel] Impossible de résoudre execution_id pour trace_id=${traceId}`);
-      return;
-    }
+    const parentExecutionId = await resolveExecutionIdFromTraceId(traceId);
+    if (!parentExecutionId) return;
 
-    console.log(`[otel] Attente active de la fin de l'exécution n8n #${executionId}...`);
-
-    let detail = null;
+    console.log(`[otel] Attente active du workflow parent #${parentExecutionId}...`);
 
     const renderKeepAliveTimer = setInterval(() => {
       fetch(`${PUBLIC_PROXY_URL}/`).catch(() => {});
     }, 2000);
 
+    let parentDetail = null;
     try {
-      for (let attempt = 0; attempt < 40; attempt++) {
-        try {
-          detail = await n8nGet(`/executions/${executionId}?includeData=true`);
-          if (detail && detail.stoppedAt) break;
-        } catch (e) {
-          // Attente pendant l'exécution n8n
-        }
-        await new Promise(r => setTimeout(r, 1500));
-      }
+      parentDetail = await waitForExecutionToFinish(parentExecutionId, 40);
     } finally {
       clearInterval(renderKeepAliveTimer);
     }
 
-    if (!detail || !detail.stoppedAt) {
-      console.warn(`[otel] Exécution ${executionId} non terminée après 60s, abandon.`);
+    if (!parentDetail || !parentDetail.stoppedAt) {
+      console.warn(`[otel] Exécution parent #${parentExecutionId} non terminée, abandon.`);
       return;
     }
 
-    const parsed = parseExecution(detail);
-    await buildAndExportSpans(parsed, traceId);
+    // 🔹 Recherche automatique des sous-exécutions adjacentes (#parentExecutionId + 1, + 2)
+    const parentStartMs = Date.parse(parentDetail.startedAt);
+    const parentEndMs = Date.parse(parentDetail.stoppedAt);
+    const allParsed = [parseExecution(parentDetail)];
+
+    for (let offset = 1; offset <= 3; offset++) {
+      const childId = parentExecutionId + offset;
+      try {
+        const childDetail = await waitForExecutionToFinish(childId, 5);
+        if (childDetail && childDetail.startedAt) {
+          const childStartMs = Date.parse(childDetail.startedAt);
+          if (childStartMs >= parentStartMs - 1000 && childStartMs <= parentEndMs + 5000) {
+            console.log(`[otel] Sous-workflow #${childId} (${childDetail.workflowData?.name}) rattaché au parent #${parentExecutionId}`);
+            allParsed.push(parseExecution(childDetail));
+          }
+        }
+      } catch (e) {}
+    }
+
+    await buildAndExportUnifiedSpans(allParsed, traceId);
 
   } catch (e) {
     console.error(`[otel] Erreur lors du traitement du traceparent ${traceparentHeader}:`, e.message);
