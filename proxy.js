@@ -7,6 +7,9 @@ setupTracer();
 // ✅ Compteurs d'appels HTTP par traceId pour dériver des Span IDs uniques
 const traceCallCounters = new Map();
 
+// 🔹 Mémoire globale du dernier traceparent actif reçu
+let lastActiveTraceparent = null;
+
 function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
@@ -16,10 +19,18 @@ let lastUsage = {};
 const server = http.createServer((req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
-  const traceparentHeader = req.headers['traceparent'];
+  // 🔹 Récupération ou réutilisation du traceparent
+  let traceparentHeader = req.headers['traceparent'];
+
   if (traceparentHeader) {
-    console.log(`[trace-hook] traceparent reçu: ${traceparentHeader}`);
+    // Si la requête contient un traceparent, on le mémorise
+    lastActiveTraceparent = traceparentHeader;
+    console.log(`[trace-hook] traceparent reçu et mémorisé: ${traceparentHeader}`);
     triggerTraceFromTraceparent(traceparentHeader);
+  } else if (lastActiveTraceparent) {
+    // Si la requête N'A PAS de traceparent (ex: /mcp-proxy), on réutilise le dernier mémorisé !
+    traceparentHeader = lastActiveTraceparent;
+    console.log(`[trace-hook] traceparent réutilisé depuis la mémoire: ${traceparentHeader}`);
   }
 
   // ✅ Health check
@@ -58,7 +69,7 @@ const server = http.createServer((req, res) => {
 
   let targetPath;
   if (isMcp) {
-    targetPath = req.url; // Conserve /mcp-proxy et ses éventuels paramètres
+    targetPath = req.url;
     console.log(`→ Kong MCP Proxy: ${targetPath}`);
   } else if (isEmbedding) {
     targetPath = '/ai-api/v1/embeddings';
@@ -70,7 +81,7 @@ const server = http.createServer((req, res) => {
 
   const requestStartTime = Date.now();
 
-  // 🔹 Réécriture dynamique du traceparent transmis à Kong
+  // 🔹 Réécriture dynamique du traceparent transmis à Kong (y compris pour MCP)
   if (traceparentHeader) {
     const parts = traceparentHeader.split("-");
     if (parts.length >= 4) {
@@ -95,7 +106,7 @@ const server = http.createServer((req, res) => {
       }
 
       headers['traceparent'] = `00-${traceId}-${derivedSpanId}-01`;
-      console.log(`→ Header traceparent réécrit pour Kong: 00-${traceId}-${derivedSpanId}-01`);
+      console.log(`→ Header traceparent transmis à Kong: 00-${traceId}-${derivedSpanId}-01`);
     }
   }
 
@@ -104,7 +115,6 @@ const server = http.createServer((req, res) => {
   req.on('end', () => {
     let reqBody = Buffer.concat(reqChunks);
 
-    // 🔹 Exécuter les transformations JSON uniquement si CE N'EST PAS du MCP
     if (!isMcp) {
       try {
         const reqJson = JSON.parse(reqBody.toString());
