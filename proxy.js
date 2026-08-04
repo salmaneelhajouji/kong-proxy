@@ -10,28 +10,56 @@ const traceCallCounters = new Map();
 // 🔹 Mémoire globale du dernier traceparent actif reçu
 let lastActiveTraceparent = null;
 
+// Cache dynamique pour la résolution du Trace ID via l'API n8n
+let cachedParentTraceId = null;
+let cachedParentExecId = null;
+let lastCacheTime = 0;
+
+function deriveTraceId(seed) {
+  return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
+}
+
 function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
+// 🔹 Résolution dynamique du Trace ID depuis l'API n8n
+async function resolveParentTraceId() {
+  const now = Date.now();
+  if (cachedParentTraceId && (now - lastCacheTime < 4000)) {
+    return cachedParentTraceId;
+  }
+
+  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) {
+    return null;
+  }
+
+  try {
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=5`;
+    const resp = await fetch(url, {
+      headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
+    });
+    if (resp.ok) {
+      const body = await resp.json();
+      const executions = body.data || [];
+      const mainExec = executions.find(e => e.mode === 'webhook' || e.mode === 'manual' || e.mode === 'trigger') || executions[0];
+      if (mainExec) {
+        cachedParentExecId = mainExec.id;
+        cachedParentTraceId = deriveTraceId(mainExec.id);
+        lastCacheTime = now;
+        return cachedParentTraceId;
+      }
+    }
+  } catch (e) {
+    console.error("[proxy] Erreur de résolution du parent traceId:", e.message);
+  }
+  return null;
+}
+
 let lastUsage = {};
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
-
-  // 🔹 Récupération ou réutilisation du traceparent
-  let traceparentHeader = req.headers['traceparent'];
-
-  if (traceparentHeader) {
-    // Si la requête contient un traceparent, on le mémorise
-    lastActiveTraceparent = traceparentHeader;
-    console.log(`[trace-hook] traceparent reçu et mémorisé: ${traceparentHeader}`);
-    triggerTraceFromTraceparent(traceparentHeader);
-  } else if (lastActiveTraceparent) {
-    // Si la requête N'A PAS de traceparent (ex: /mcp-proxy), on réutilise le dernier mémorisé !
-    traceparentHeader = lastActiveTraceparent;
-    console.log(`[trace-hook] traceparent réutilisé depuis la mémoire: ${traceparentHeader}`);
-  }
 
   // ✅ Health check
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
@@ -58,57 +86,75 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  const headers = {...req.headers};
-  delete headers['authorization'];
-  delete headers['Authorization'];
-  delete headers['accept-encoding'];
+  // 🔹 Détection et Unification du Trace ID
+  let traceparentHeader = req.headers['traceparent'];
+  let traceId = null;
+
+  if (traceparentHeader) {
+    const parts = traceparentHeader.split("-");
+    if (parts.length >= 4) {
+      traceId = parts[1];
+      lastActiveTraceparent = traceparentHeader;
+    }
+  }
+
+  if (!traceId) {
+    // Tente de résoudre le traceId depuis n8n
+    traceId = await resolveParentTraceId();
+
+    if (!traceId && lastActiveTraceparent) {
+      const parts = lastActiveTraceparent.split("-");
+      if (parts.length >= 4) traceId = parts[1];
+    }
+
+    if (!traceId) {
+      traceId = crypto.randomBytes(16).toString("hex");
+    }
+  }
+
+  if (!traceCallCounters.has(traceId)) {
+    traceCallCounters.set(traceId, { chat: 0, embedding: 0, mcp: 0 });
+    setTimeout(() => traceCallCounters.delete(traceId), 10 * 60 * 1000);
+  }
+  const counters = traceCallCounters.get(traceId);
 
   // 🔹 Détection dynamique des routes
   const isMcp = req.url.includes('/mcp-proxy');
   const isEmbedding = req.url.includes('/embeddings');
 
+  let derivedSpanId;
   let targetPath;
+
   if (isMcp) {
     targetPath = req.url;
+    derivedSpanId = deriveSpanId(traceId + `-mcp-${counters.mcp}`);
+    counters.mcp++;
     console.log(`→ Kong MCP Proxy: ${targetPath}`);
   } else if (isEmbedding) {
     targetPath = '/ai-api/v1/embeddings';
+    derivedSpanId = deriveSpanId(traceId + `-embeddings-${counters.embedding}`);
+    counters.embedding++;
     console.log(`→ Kong Embeddings: ${targetPath}`);
   } else {
     targetPath = '/ai-api/v1/chat/gemini';
+    derivedSpanId = deriveSpanId(traceId + `-chat-${counters.chat}`);
+    counters.chat++;
     console.log(`→ Kong Chat: ${targetPath}`);
   }
 
+  const unifiedTraceparent = `00-${traceId}-${derivedSpanId}-01`;
+  const headers = {...req.headers};
+  delete headers['authorization'];
+  delete headers['Authorization'];
+  delete headers['accept-encoding'];
+
+  headers['traceparent'] = unifiedTraceparent;
+  console.log(`→ Header traceparent UNIFIÉ transmis à Kong: ${unifiedTraceparent}`);
+
+  // Déclenchement de la collecte OTel pour ce Trace ID unifié
+  triggerTraceFromTraceparent(unifiedTraceparent);
+
   const requestStartTime = Date.now();
-
-  // 🔹 Réécriture dynamique du traceparent transmis à Kong (y compris pour MCP)
-  if (traceparentHeader) {
-    const parts = traceparentHeader.split("-");
-    if (parts.length >= 4) {
-      const traceId = parts[1];
-
-      if (!traceCallCounters.has(traceId)) {
-        traceCallCounters.set(traceId, { chat: 0, embedding: 0, mcp: 0 });
-        setTimeout(() => traceCallCounters.delete(traceId), 10 * 60 * 1000);
-      }
-      const counters = traceCallCounters.get(traceId);
-
-      let derivedSpanId;
-      if (isMcp) {
-        derivedSpanId = deriveSpanId(traceId + `-mcp-${counters.mcp}`);
-        counters.mcp++;
-      } else if (isEmbedding) {
-        derivedSpanId = deriveSpanId(traceId + `-embeddings-${counters.embedding}`);
-        counters.embedding++;
-      } else {
-        derivedSpanId = deriveSpanId(traceId + `-chat-${counters.chat}`);
-        counters.chat++;
-      }
-
-      headers['traceparent'] = `00-${traceId}-${derivedSpanId}-01`;
-      console.log(`→ Header traceparent transmis à Kong: 00-${traceId}-${derivedSpanId}-01`);
-    }
-  }
 
   let reqChunks = [];
   req.on('data', chunk => reqChunks.push(chunk));
