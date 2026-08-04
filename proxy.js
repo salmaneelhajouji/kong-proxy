@@ -4,15 +4,15 @@ const crypto = require("crypto");
 const { setupTracer, triggerTraceFromTraceparent } = require("./otel-hook-v4.js");
 setupTracer();
 
-// ✅ Compteurs d'appels HTTP par traceId pour dériver des Span IDs uniques
+// ✅ Compteurs d'appels HTTP par traceId
 const traceCallCounters = new Map();
 
-// 🔹 Mémoire du dernier traceparent actif avec TTL de 30 secondes
+// 🔹 Mémoire du dernier traceparent avec TTL 30s
 let lastActiveTraceparent = null;
 let lastActiveTime = 0;
-const TRACE_TTL_MS = 30 * 1000; 
+const TRACE_TTL_MS = 30 * 1000;
 
-// Cache dynamique pour la résolution du Trace ID via l'API n8n
+// Cache dynamique pour la résolution du Trace ID principal
 let cachedParentTraceId = null;
 let cachedParentExecId = null;
 let lastCacheTime = 0;
@@ -25,7 +25,7 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Résolution dynamique du Trace ID depuis l'API n8n
+// 🔹 Résolution dynamique du Trace ID de "Agent Discovery" (Workflow Principal)
 async function resolveParentTraceId() {
   const now = Date.now();
   if (cachedParentTraceId && (now - lastCacheTime < 4000)) {
@@ -37,18 +37,25 @@ async function resolveParentTraceId() {
   }
 
   try {
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=5`;
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
     const resp = await fetch(url, {
       headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
     });
     if (resp.ok) {
       const body = await resp.json();
       const executions = body.data || [];
-      const mainExec = executions.find(e => e.mode === 'webhook' || e.mode === 'manual' || e.mode === 'trigger') || executions[0];
+      
+      // 🎯 RÈGLES : Ignorer "MCP Server" et forcer la sélection du Workflow Parent "Agent Discovery"
+      const mainExec = executions.find(e => {
+        const wName = (e.workflowData?.name || "").toLowerCase();
+        return !wName.includes("mcp server") && (wName.includes("agent") || e.mode === "webhook" || e.mode === "manual");
+      }) || executions.find(e => !(e.workflowData?.name || "").toLowerCase().includes("mcp server")) || executions[0];
+
       if (mainExec) {
         cachedParentExecId = mainExec.id;
         cachedParentTraceId = deriveTraceId(mainExec.id);
         lastCacheTime = now;
+        console.log(`[proxy] Workflow Racine trouvé : #${mainExec.id} (${mainExec.workflowData?.name})`);
         return cachedParentTraceId;
       }
     }
@@ -63,7 +70,6 @@ let lastUsage = {};
 const server = http.createServer(async (req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
-  // ✅ Health check & endpoints internes
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ status: 'ok' }));
@@ -88,7 +94,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 🔹 Détection et Unification du Trace ID avec gestion TTL
   let traceparentHeader = req.headers['traceparent'];
   let traceId = null;
   const now = Date.now();
@@ -104,7 +109,6 @@ const server = http.createServer(async (req, res) => {
     traceparentHeader = lastActiveTraceparent;
     const parts = traceparentHeader.split("-");
     if (parts.length >= 4) traceId = parts[1];
-    console.log(`[trace-hook] traceparent réutilisé (actif depuis ${Math.round((now - lastActiveTime)/1000)}s)`);
   } else {
     lastActiveTraceparent = null;
   }
@@ -122,7 +126,6 @@ const server = http.createServer(async (req, res) => {
   }
   const counters = traceCallCounters.get(traceId);
 
-  // 🔹 Détection dynamique des routes
   const isMcp = req.url.includes('/mcp-proxy');
   const isEmbedding = req.url.includes('/embeddings');
 
@@ -155,7 +158,6 @@ const server = http.createServer(async (req, res) => {
   headers['traceparent'] = unifiedTraceparent;
   console.log(`→ Header traceparent UNIFIÉ transmis à Kong: ${unifiedTraceparent}`);
 
-  // Déclenchement de la collecte OTel
   triggerTraceFromTraceparent(unifiedTraceparent);
 
   const requestStartTime = Date.now();
