@@ -26,7 +26,7 @@ function parseHeaders(raw) {
   return result;
 }
 
-// ── Détecteurs mutuellement exclusifs ─────────────────────────────────────────
+// ── Détecteurs de nœuds ───────────────────────────────────────────────────────
 function isEmbeddingsNode(node) {
   const t = (node.nodeType || "").toLowerCase();
   const n = (node.nodeName || "").toLowerCase();
@@ -52,6 +52,18 @@ function isAgentNode(node) {
   const t = (node.nodeType || "").toLowerCase();
   const n = (node.nodeName || "").toLowerCase();
   return t.includes("agent") || n.includes("agent");
+}
+
+function isMcpClientNode(node) {
+  const t = (node.nodeType || "").toLowerCase();
+  const n = (node.nodeName || "").toLowerCase();
+  return t.includes("mcpclient") || n.includes("mcp client");
+}
+
+function isMcpTriggerNode(node) {
+  const t = (node.nodeType || "").toLowerCase();
+  const n = (node.nodeName || "").toLowerCase();
+  return t.includes("mcptrigger") || n.includes("mcp server trigger");
 }
 
 let forcedTraceId = null;
@@ -98,7 +110,7 @@ function setupTracer() {
   provider.register();
 
   tracer = trace.getTracer("n8n-webhook-hook");
-  console.log(`[otel] Tracer initialisé (Mode Multi-Workflow Instantané) -> ${OTEL_ENDPOINT}`);
+  console.log(`[otel] Tracer initialisé (Mode Arbre Hiérarchique MCP) -> ${OTEL_ENDPOINT}`);
 }
 
 function deriveTraceId(seed) {
@@ -264,6 +276,7 @@ async function waitForExecutionToFinish(executionId, maxAttempts = 40) {
   return null;
 }
 
+// 🔹 Export avec liaisons parent-enfant explicites
 async function buildAndExportUnifiedSpans(allParsed, traceId) {
   const mainParsed = allParsed[0];
   const { parent: mainParent } = mainParsed;
@@ -299,12 +312,6 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
   const rootCtx = trace.setSpan(context.active(), rootSpan);
   const spanContextMap = new Map();
 
-  const embeddingsNode = allNodes.find(n => isEmbeddingsNode(n));
-  let embeddingsEndMs = 0;
-  if (embeddingsNode) {
-    embeddingsEndMs = (embeddingsNode.startTimeMs || startMs) + Math.max(embeddingsNode.durationMs || 1, 1);
-  }
-
   allNodes.forEach(node => {
     const durationMs = Math.max(node.durationMs || 1, 1);
     let nodeStartMs = node.startTimeMs || startMs;
@@ -313,32 +320,39 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     if (isAgentNode(node)) {
       nodeEndMs = maxEndMs;
     }
-    
-    if (isVectorNode(node) && embeddingsEndMs > 0) {
-      nodeEndMs = Math.max(nodeEndMs, embeddingsEndMs + 50);
-    }
 
     if (nodeStartMs < startMs) nodeStartMs = startMs;
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
+    const nodeKey = `${node.workflowName}_${node.nodeName}_${node.executionIndex}_${node.runIndex}`;
+
+    // 🔹 Recherche dynamique des contextes parents
+    const findCtx = (predicate) => {
+      const entry = Array.from(spanContextMap.entries()).find(([key, ctx]) => {
+        const matchingNode = allNodes.find(n => `${n.workflowName}_${n.nodeName}_${n.executionIndex}_${n.runIndex}` === key);
+        return matchingNode && predicate(matchingNode);
+      });
+      return entry ? entry[1] : null;
+    };
+
+    const agentCtx = findCtx(isAgentNode);
+    const mcpClientCtx = findCtx(isMcpClientNode);
+    const mcpTriggerCtx = findCtx(isMcpTriggerNode);
+    const vectorCtx = findCtx(isVectorNode);
+
     let parentSpanContext = null;
-    const uniqueNodeKey = `${node.workflowName}_${node.nodeName}_${node.executionIndex}_${node.runIndex}`;
 
-    const agentEntry = Array.from(spanContextMap.entries()).find(([key]) => {
-      return key.includes("Agent") || key.includes("agent");
-    });
-
-    if (isEmbeddingsNode(node)) {
-      const vectorEntry = Array.from(spanContextMap.entries()).find(([key]) => key.includes("Vector") || key.includes("Pinecone"));
-      if (vectorEntry) parentSpanContext = vectorEntry[1];
-      else if (agentEntry) parentSpanContext = agentEntry[1];
-    } else if (isLlmNode(node) || isVectorNode(node)) {
-      if (agentEntry) parentSpanContext = agentEntry[1];
-    }
-
-    if (!parentSpanContext && node.sourceNode) {
-      const sourceEntry = Array.from(spanContextMap.entries()).find(([key]) => key.includes(`_${node.sourceNode}_`));
-      if (sourceEntry) parentSpanContext = sourceEntry[1];
+    // 🌳 RÈGLES DE L'ARBRE DE TRACE (HIÉRARCHIE)
+    if (isMcpClientNode(node) || isLlmNode(node)) {
+      parentSpanContext = agentCtx;
+    } else if (isMcpTriggerNode(node)) {
+      parentSpanContext = mcpClientCtx || agentCtx;
+    } else if (isVectorNode(node)) {
+      parentSpanContext = mcpTriggerCtx || mcpClientCtx || agentCtx;
+    } else if (isEmbeddingsNode(node)) {
+      parentSpanContext = vectorCtx || mcpTriggerCtx || agentCtx;
+    } else if (node.sourceNode) {
+      parentSpanContext = findCtx(n => n.nodeName === node.sourceNode);
     }
 
     const parentCtxToUse = parentSpanContext
@@ -381,7 +395,7 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     if (node.outputData) childSpan.setAttribute("output.value", truncate(node.outputData));
 
     childSpan.setStatus({ code: toOtelStatusCode(node.status) });
-    spanContextMap.set(uniqueNodeKey, childSpan.spanContext());
+    spanContextMap.set(nodeKey, childSpan.spanContext());
 
     childSpan.end(nodeEndMs);
   });
@@ -389,7 +403,7 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
   rootSpan.end(maxEndMs);
 
   if (provider) await provider.forceFlush();
-  console.log(`[otel] Export unifié réussi pour [Parent #${mainParent.executionId}] avec ${allParsed.length} workflows liés | trace_id=${traceId}`);
+  console.log(`[otel] Exportation réussie de l'arbre complet pour [Parent #${mainParent.executionId}] | trace_id=${traceId}`);
 }
 
 async function processTraceparentAsync(traceparentHeader) {
@@ -430,7 +444,7 @@ async function processTraceparentAsync(traceparentHeader) {
         if (childDetail && childDetail.startedAt) {
           const childStartMs = Date.parse(childDetail.startedAt);
           if (childStartMs >= parentStartMs - 1000 && childStartMs <= parentEndMs + 5000) {
-            console.log(`[otel] Sous-workflow #${childId} (${childDetail.workflowData?.name}) rattaché au parent #${parentExecutionId}`);
+            console.log(`[otel] Sous-workflow #${childId} (${childDetail.workflowData?.name}) rattaché à l'arbre`);
             allParsed.push(parseExecution(childDetail));
           }
         }
