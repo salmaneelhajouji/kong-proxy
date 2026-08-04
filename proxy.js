@@ -6,35 +6,21 @@ setupTracer();
 
 const traceCallCounters = new Map();
 
-// 🔹 Verrou du Trace ID Racine (Agent Discovery)
-let activeAgentTraceId = null;
-let lastAgentActivityTime = 0;
-const AGENT_LOCK_TTL_MS = 2 * 60 * 1000; // Verrou de 2 minutes
-
-function deriveTraceId(seed) {
-  return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
+// 🔹 Calcul déterministe identique au nœud "Code in JavaScript" de n8n
+function deriveTraceId(executionId) {
+  return crypto.createHash("sha256").update(String(executionId)).digest("hex").slice(0, 32);
 }
 
 function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Interrogation de l'API n8n pour verrouiller l'exécution principale "Agent Discovery"
-// 🔹 Résolution ciblée sur le nom exact de ton Workflow Parent
-async function getOrFetchParentTraceId() {
-  const now = Date.now();
-  
-  if (activeAgentTraceId && (now - lastAgentActivityTime < AGENT_LOCK_TTL_MS)) {
-    lastAgentActivityTime = now;
-    return activeAgentTraceId;
-  }
-
-  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) {
-    return crypto.randomBytes(16).toString("hex");
-  }
+// 🔹 Récupération automatique de l'execution_id de "Agent Discovery"
+async function fetchAgentDiscoveryTraceId() {
+  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) return null;
 
   try {
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=15`;
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
     const resp = await fetch(url, {
       headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
     });
@@ -42,25 +28,24 @@ async function getOrFetchParentTraceId() {
       const body = await resp.json();
       const executions = body.data || [];
       
-      // 🎯 Cibler spécifiquement "Agent Discovery" et ignorer strictement "MCP Server"
-      const parentExec = executions.find(e => {
+      // 🎯 Trouver l'exécution racine "Agent Discovery" (exclure MCP Server)
+      const agentExec = executions.find(e => {
         const name = (e.workflowData?.name || "").toLowerCase();
-        return name.includes("agent discovery") && !name.includes("mcp server");
+        return name.includes("agent discovery") || (name.includes("agent") && !name.includes("mcp server"));
       }) || executions.find(e => !(e.workflowData?.name || "").toLowerCase().includes("mcp server"));
 
-      if (parentExec) {
-        activeAgentTraceId = deriveTraceId(parentExec.id);
-        lastAgentActivityTime = now;
-        console.log(`[proxy] 🟢 Parent RACINE trouvé (#${parentExec.id} - ${parentExec.workflowData?.name}): ${activeAgentTraceId}`);
-        return activeAgentTraceId;
+      if (agentExec) {
+        const derived = deriveTraceId(agentExec.id);
+        console.log(`[proxy] 🎯 Sync parfait avec Agent Discovery (#${agentExec.id}) -> trace_id: ${derived}`);
+        return derived;
       }
     }
   } catch (e) {
-    console.error("[proxy] Erreur de récupération execution n8n:", e.message);
+    console.error("[proxy] Erreur sync n8n API:", e.message);
   }
-
-  return crypto.randomBytes(16).toString("hex");
+  return null;
 }
+
 let lastUsage = {};
 
 const server = http.createServer(async (req, res) => {
@@ -90,8 +75,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 🔹 Récupération ou verrouillage du Trace ID unifié
-  const traceId = await getOrFetchParentTraceId();
+  // 🔹 Calcul du Trace ID identique à n8n
+  let traceId = await fetchAgentDiscoveryTraceId();
+  if (!traceId) {
+    traceId = crypto.randomBytes(16).toString("hex");
+  }
 
   if (!traceCallCounters.has(traceId)) {
     traceCallCounters.set(traceId, { chat: 0, embedding: 0, mcp: 0 });
@@ -109,17 +97,14 @@ const server = http.createServer(async (req, res) => {
     targetPath = req.url;
     derivedSpanId = deriveSpanId(traceId + `-mcp-${counters.mcp}`);
     counters.mcp++;
-    console.log(`→ Kong MCP Proxy: ${targetPath}`);
   } else if (isEmbedding) {
     targetPath = '/ai-api/v1/embeddings';
     derivedSpanId = deriveSpanId(traceId + `-embeddings-${counters.embedding}`);
     counters.embedding++;
-    console.log(`→ Kong Embeddings: ${targetPath}`);
   } else {
     targetPath = '/ai-api/v1/chat/gemini';
     derivedSpanId = deriveSpanId(traceId + `-chat-${counters.chat}`);
     counters.chat++;
-    console.log(`→ Kong Chat: ${targetPath}`);
   }
 
   const unifiedTraceparent = `00-${traceId}-${derivedSpanId}-01`;
