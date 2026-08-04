@@ -4,18 +4,13 @@ const crypto = require("crypto");
 const { setupTracer, triggerTraceFromTraceparent } = require("./otel-hook-v4.js");
 setupTracer();
 
-// ✅ Compteurs d'appels HTTP par traceId
+// ✅ Compteurs d'appels par traceId pour générer des Span IDs uniques
 const traceCallCounters = new Map();
 
-// 🔹 Mémoire du dernier traceparent avec TTL 30s
-let lastActiveTraceparent = null;
-let lastActiveTime = 0;
-const TRACE_TTL_MS = 30 * 1000;
-
-// Cache dynamique pour la résolution du Trace ID principal
-let cachedParentTraceId = null;
-let cachedParentExecId = null;
-let lastCacheTime = 0;
+// 🔹 Verrou du Trace ID principal (Agent Discovery)
+let lockedMainTraceId = null;
+let lastLockTime = 0;
+const LOCK_TTL_MS = 3 * 60 * 1000; // Valide 3 minutes par exécution de workflow
 
 function deriveTraceId(seed) {
   return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
@@ -25,16 +20,9 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Résolution dynamique du Trace ID de "Agent Discovery" (Workflow Principal)
-async function resolveParentTraceId() {
-  const now = Date.now();
-  if (cachedParentTraceId && (now - lastCacheTime < 4000)) {
-    return cachedParentTraceId;
-  }
-
-  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) {
-    return null;
-  }
+// 🔹 Résolution de secours : Recherche du workflow principal (ignore MCP Server)
+async function resolveMainWorkflowTraceId() {
+  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) return null;
 
   try {
     const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
@@ -45,22 +33,19 @@ async function resolveParentTraceId() {
       const body = await resp.json();
       const executions = body.data || [];
       
-      // 🎯 RÈGLES : Ignorer "MCP Server" et forcer la sélection du Workflow Parent "Agent Discovery"
+      // 🎯 Filtrer pour exclure "MCP Server" et prendre le workflow parent "Agent Discovery"
       const mainExec = executions.find(e => {
-        const wName = (e.workflowData?.name || "").toLowerCase();
-        return !wName.includes("mcp server") && (wName.includes("agent") || e.mode === "webhook" || e.mode === "manual");
-      }) || executions.find(e => !(e.workflowData?.name || "").toLowerCase().includes("mcp server")) || executions[0];
+        const name = (e.workflowData?.name || "").toLowerCase();
+        return !name.includes("mcp server") && (name.includes("agent") || e.mode === "webhook" || e.mode === "manual");
+      }) || executions.find(e => !(e.workflowData?.name || "").toLowerCase().includes("mcp server"));
 
       if (mainExec) {
-        cachedParentExecId = mainExec.id;
-        cachedParentTraceId = deriveTraceId(mainExec.id);
-        lastCacheTime = now;
-        console.log(`[proxy] Workflow Racine trouvé : #${mainExec.id} (${mainExec.workflowData?.name})`);
-        return cachedParentTraceId;
+        console.log(`[proxy] Workflow Racine identifié via API n8n : #${mainExec.id} (${mainExec.workflowData?.name})`);
+        return deriveTraceId(mainExec.id);
       }
     }
   } catch (e) {
-    console.error("[proxy] Erreur de résolution du parent traceId:", e.message);
+    console.error("[proxy] Erreur de résolution du workflow racine:", e.message);
   }
   return null;
 }
@@ -70,6 +55,7 @@ let lastUsage = {};
 const server = http.createServer(async (req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
+  // Health checks
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ status: 'ok' }));
@@ -94,28 +80,34 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  let traceparentHeader = req.headers['traceparent'];
-  let traceId = null;
   const now = Date.now();
+  let incomingTraceparent = req.headers['traceparent'];
+  let traceId = null;
 
-  if (traceparentHeader) {
-    const parts = traceparentHeader.split("-");
+  // 1️⃣ Si un traceparent provient du premier appel Chat/LLM du workflow principal
+  if (incomingTraceparent) {
+    const parts = incomingTraceparent.split("-");
     if (parts.length >= 4) {
       traceId = parts[1];
-      lastActiveTraceparent = traceparentHeader;
-      lastActiveTime = now;
+      lockedMainTraceId = traceId;
+      lastLockTime = now;
+      console.log(`[proxy] Trace Racine verrouillée : ${traceId}`);
     }
-  } else if (lastActiveTraceparent && (now - lastActiveTime < TRACE_TTL_MS)) {
-    traceparentHeader = lastActiveTraceparent;
-    const parts = traceparentHeader.split("-");
-    if (parts.length >= 4) traceId = parts[1];
-  } else {
-    lastActiveTraceparent = null;
   }
 
+  // 2️⃣ Si pas de traceparent (ex: /mcp-proxy), réutiliser la Trace Racine verrouillée
+  if (!traceId && lockedMainTraceId && (now - lastLockTime < LOCK_TTL_MS)) {
+    traceId = lockedMainTraceId;
+    console.log(`[proxy] Injection du Trace ID Racine sur la requête MCP : ${traceId}`);
+  }
+
+  // 3️⃣ En dernier recours, interroger n8n pour trouver Agent Discovery
   if (!traceId) {
-    traceId = await resolveParentTraceId();
-    if (!traceId) {
+    traceId = await resolveMainWorkflowTraceId();
+    if (traceId) {
+      lockedMainTraceId = traceId;
+      lastLockTime = now;
+    } else {
       traceId = crypto.randomBytes(16).toString("hex");
     }
   }
@@ -149,6 +141,7 @@ const server = http.createServer(async (req, res) => {
     console.log(`→ Kong Chat: ${targetPath}`);
   }
 
+  // 🔹 Envoi du header UNIFIÉ à Kong et déclenchement de la télémétrie
   const unifiedTraceparent = `00-${traceId}-${derivedSpanId}-01`;
   const headers = {...req.headers};
   delete headers['authorization'];
