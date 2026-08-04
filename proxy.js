@@ -7,8 +7,10 @@ setupTracer();
 // ✅ Compteurs d'appels HTTP par traceId pour dériver des Span IDs uniques
 const traceCallCounters = new Map();
 
-// 🔹 Mémoire globale du dernier traceparent actif reçu
+// 🔹 Mémoire du dernier traceparent actif avec TTL de 30 secondes
 let lastActiveTraceparent = null;
+let lastActiveTime = 0;
+const TRACE_TTL_MS = 30 * 1000; 
 
 // Cache dynamique pour la résolution du Trace ID via l'API n8n
 let cachedParentTraceId = null;
@@ -61,7 +63,7 @@ let lastUsage = {};
 const server = http.createServer(async (req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
-  // ✅ Health check
+  // ✅ Health check & endpoints internes
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ status: 'ok' }));
@@ -86,27 +88,29 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 🔹 Détection et Unification du Trace ID
+  // 🔹 Détection et Unification du Trace ID avec gestion TTL
   let traceparentHeader = req.headers['traceparent'];
   let traceId = null;
+  const now = Date.now();
 
   if (traceparentHeader) {
     const parts = traceparentHeader.split("-");
     if (parts.length >= 4) {
       traceId = parts[1];
       lastActiveTraceparent = traceparentHeader;
+      lastActiveTime = now;
     }
+  } else if (lastActiveTraceparent && (now - lastActiveTime < TRACE_TTL_MS)) {
+    traceparentHeader = lastActiveTraceparent;
+    const parts = traceparentHeader.split("-");
+    if (parts.length >= 4) traceId = parts[1];
+    console.log(`[trace-hook] traceparent réutilisé (actif depuis ${Math.round((now - lastActiveTime)/1000)}s)`);
+  } else {
+    lastActiveTraceparent = null;
   }
 
   if (!traceId) {
-    // Tente de résoudre le traceId depuis n8n
     traceId = await resolveParentTraceId();
-
-    if (!traceId && lastActiveTraceparent) {
-      const parts = lastActiveTraceparent.split("-");
-      if (parts.length >= 4) traceId = parts[1];
-    }
-
     if (!traceId) {
       traceId = crypto.randomBytes(16).toString("hex");
     }
@@ -151,7 +155,7 @@ const server = http.createServer(async (req, res) => {
   headers['traceparent'] = unifiedTraceparent;
   console.log(`→ Header traceparent UNIFIÉ transmis à Kong: ${unifiedTraceparent}`);
 
-  // Déclenchement de la collecte OTel pour ce Trace ID unifié
+  // Déclenchement de la collecte OTel
   triggerTraceFromTraceparent(unifiedTraceparent);
 
   const requestStartTime = Date.now();
