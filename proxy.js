@@ -20,10 +20,10 @@ function deriveSpanId(seed) {
 }
 
 // 🔹 Interrogation de l'API n8n pour verrouiller l'exécution principale "Agent Discovery"
+// 🔹 Résolution ciblée sur le nom exact de ton Workflow Parent
 async function getOrFetchParentTraceId() {
   const now = Date.now();
   
-  // Si un Trace ID est déjà verrouillé et actif depuis moins de 2 minutes, on le réutilise !
   if (activeAgentTraceId && (now - lastAgentActivityTime < AGENT_LOCK_TTL_MS)) {
     lastAgentActivityTime = now;
     return activeAgentTraceId;
@@ -34,7 +34,7 @@ async function getOrFetchParentTraceId() {
   }
 
   try {
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=15`;
     const resp = await fetch(url, {
       headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
     });
@@ -42,16 +42,16 @@ async function getOrFetchParentTraceId() {
       const body = await resp.json();
       const executions = body.data || [];
       
-      // 🎯 Sélectionner l'exécution parent "Agent Discovery" (exclure MCP Server)
+      // 🎯 Cibler spécifiquement "Agent Discovery" et ignorer strictement "MCP Server"
       const parentExec = executions.find(e => {
         const name = (e.workflowData?.name || "").toLowerCase();
-        return !name.includes("mcp server") && (name.includes("agent") || e.mode === "webhook" || e.mode === "manual");
-      }) || executions.find(e => !(e.workflowData?.name || "").toLowerCase().includes("mcp server")) || executions[0];
+        return name.includes("agent discovery") && !name.includes("mcp server");
+      }) || executions.find(e => !(e.workflowData?.name || "").toLowerCase().includes("mcp server"));
 
       if (parentExec) {
         activeAgentTraceId = deriveTraceId(parentExec.id);
         lastAgentActivityTime = now;
-        console.log(`[proxy] 🟢 Trace Racine VERROUILLÉE sur Agent Discovery (#${parentExec.id}): ${activeAgentTraceId}`);
+        console.log(`[proxy] 🟢 Parent RACINE trouvé (#${parentExec.id} - ${parentExec.workflowData?.name}): ${activeAgentTraceId}`);
         return activeAgentTraceId;
       }
     }
@@ -61,7 +61,6 @@ async function getOrFetchParentTraceId() {
 
   return crypto.randomBytes(16).toString("hex");
 }
-
 let lastUsage = {};
 
 const server = http.createServer(async (req, res) => {
