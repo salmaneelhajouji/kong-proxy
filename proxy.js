@@ -6,19 +6,65 @@ setupTracer();
 
 const traceCallCounters = new Map();
 
-// 🔹 Mémoire stricte du Trace ID Racine (Agent Discovery)
-let currentAgentTraceId = null;
-let currentAgentTraceparent = null;
+// 🔹 Verrou du Trace ID Racine (Agent Discovery)
+let activeAgentTraceId = null;
 let lastAgentActivityTime = 0;
-const AGENT_TIMEOUT_MS = 2 * 60 * 1000; // Garde le verrou 2 minutes max
+const AGENT_LOCK_TTL_MS = 2 * 60 * 1000; // Verrou de 2 minutes
+
+function deriveTraceId(seed) {
+  return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
+}
 
 function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
+// 🔹 Interrogation de l'API n8n pour verrouiller l'exécution principale "Agent Discovery"
+async function getOrFetchParentTraceId() {
+  const now = Date.now();
+  
+  // Si un Trace ID est déjà verrouillé et actif depuis moins de 2 minutes, on le réutilise !
+  if (activeAgentTraceId && (now - lastAgentActivityTime < AGENT_LOCK_TTL_MS)) {
+    lastAgentActivityTime = now;
+    return activeAgentTraceId;
+  }
+
+  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) {
+    return crypto.randomBytes(16).toString("hex");
+  }
+
+  try {
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
+    const resp = await fetch(url, {
+      headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
+    });
+    if (resp.ok) {
+      const body = await resp.json();
+      const executions = body.data || [];
+      
+      // 🎯 Sélectionner l'exécution parent "Agent Discovery" (exclure MCP Server)
+      const parentExec = executions.find(e => {
+        const name = (e.workflowData?.name || "").toLowerCase();
+        return !name.includes("mcp server") && (name.includes("agent") || e.mode === "webhook" || e.mode === "manual");
+      }) || executions.find(e => !(e.workflowData?.name || "").toLowerCase().includes("mcp server")) || executions[0];
+
+      if (parentExec) {
+        activeAgentTraceId = deriveTraceId(parentExec.id);
+        lastAgentActivityTime = now;
+        console.log(`[proxy] 🟢 Trace Racine VERROUILLÉE sur Agent Discovery (#${parentExec.id}): ${activeAgentTraceId}`);
+        return activeAgentTraceId;
+      }
+    }
+  } catch (e) {
+    console.error("[proxy] Erreur de récupération execution n8n:", e.message);
+  }
+
+  return crypto.randomBytes(16).toString("hex");
+}
+
 let lastUsage = {};
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
@@ -45,33 +91,8 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  const now = Date.now();
-  let incomingTraceparent = req.headers['traceparent'];
-  let traceId = null;
-
-  // 1️⃣ CAS 1 : Requête avec traceparent (Premier appel Chat Gemini venant de Agent Discovery)
-  if (incomingTraceparent) {
-    const parts = incomingTraceparent.split("-");
-    if (parts.length >= 4) {
-      traceId = parts[1];
-      // On MÉMORISE et VERROUILLE cet ID comme étant le seul et unique ID de l'agent en cours
-      currentAgentTraceId = traceId;
-      currentAgentTraceparent = incomingTraceparent;
-      lastAgentActivityTime = now;
-      console.log(`[proxy] 🟢 Trace Racine VERROUILLÉE depuis l'agent: ${traceId}`);
-    }
-  } 
-  // 2️⃣ CAS 2 : Requête SANS traceparent (Appel de MCP Client1 vers /mcp-proxy)
-  else if (currentAgentTraceId && (now - lastAgentActivityTime < AGENT_TIMEOUT_MS)) {
-    // On FORCE la réutilisation du Trace ID de l'Agent Discovery
-    traceId = currentAgentTraceId;
-    lastAgentActivityTime = now; // On prolonge l'activité
-    console.log(`[proxy] 🔵 Réinjection forcée du Trace ID Racine sur MCP Client1: ${traceId}`);
-  } 
-  // 3️⃣ CAS 3 : Aucun agent actif
-  else {
-    traceId = crypto.randomBytes(16).toString("hex");
-  }
+  // 🔹 Récupération ou verrouillage du Trace ID unifié
+  const traceId = await getOrFetchParentTraceId();
 
   if (!traceCallCounters.has(traceId)) {
     traceCallCounters.set(traceId, { chat: 0, embedding: 0, mcp: 0 });
@@ -89,14 +110,17 @@ const server = http.createServer((req, res) => {
     targetPath = req.url;
     derivedSpanId = deriveSpanId(traceId + `-mcp-${counters.mcp}`);
     counters.mcp++;
+    console.log(`→ Kong MCP Proxy: ${targetPath}`);
   } else if (isEmbedding) {
     targetPath = '/ai-api/v1/embeddings';
     derivedSpanId = deriveSpanId(traceId + `-embeddings-${counters.embedding}`);
     counters.embedding++;
+    console.log(`→ Kong Embeddings: ${targetPath}`);
   } else {
     targetPath = '/ai-api/v1/chat/gemini';
     derivedSpanId = deriveSpanId(traceId + `-chat-${counters.chat}`);
     counters.chat++;
+    console.log(`→ Kong Chat: ${targetPath}`);
   }
 
   const unifiedTraceparent = `00-${traceId}-${derivedSpanId}-01`;
