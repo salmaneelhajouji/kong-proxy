@@ -5,7 +5,6 @@ const { OTLPTraceExporter } = require("@opentelemetry/exporter-trace-otlp-http")
 const { Resource } = require("@opentelemetry/resources");
 const { SemanticResourceAttributes } = require("@opentelemetry/semantic-conventions");
 
-// ── Config ───────────────────────────────────────────────────────────────────
 const N8N_HOST = process.env.N8N_HOST;
 const N8N_API_KEY = process.env.N8N_API_KEY;
 const OTEL_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
@@ -26,7 +25,6 @@ function parseHeaders(raw) {
   return result;
 }
 
-// ── Détecteurs mutuellement exclusifs ─────────────────────────────────────────
 function isEmbeddingsNode(node) {
   const t = (node.nodeType || "").toLowerCase();
   const n = (node.nodeName || "").toLowerCase();
@@ -276,7 +274,6 @@ async function waitForExecutionToFinish(executionId, maxAttempts = 40) {
   return null;
 }
 
-// 🔹 Export avec liaisons parent-enfant sous la racine unique
 async function buildAndExportUnifiedSpans(allParsed, traceId) {
   const mainParsed = allParsed[0];
   const { parent: mainParent } = mainParsed;
@@ -341,7 +338,6 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
 
     let parentSpanContext = null;
 
-    // 🌳 RÈGLES D'EMBOÎTEMENT DES NŒUDS
     if (isMcpClientNode(node) || isLlmNode(node)) {
       parentSpanContext = agentCtx;
     } else if (isMcpTriggerNode(node)) {
