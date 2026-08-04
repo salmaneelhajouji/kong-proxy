@@ -4,10 +4,8 @@ const crypto = require("crypto");
 const { setupTracer, triggerTraceFromTraceparent } = require("./otel-hook-v4.js");
 setupTracer();
 
-// ✅ Compteurs d'appels par traceId pour générer des Span IDs uniques
 const traceCallCounters = new Map();
 
-// 🔹 Verrou du Trace ID principal (Agent Discovery)
 let lockedMainTraceId = null;
 let lastLockTime = 0;
 const LOCK_TTL_MS = 3 * 60 * 1000; // Valide 3 minutes par exécution de workflow
@@ -20,12 +18,12 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Résolution de secours : Recherche du workflow principal (ignore MCP Server)
+// 🔹 Résolution stricte : On ignore tout sous-workflow MCP Server
 async function resolveMainWorkflowTraceId() {
   if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) return null;
 
   try {
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=15`;
     const resp = await fetch(url, {
       headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
     });
@@ -33,15 +31,16 @@ async function resolveMainWorkflowTraceId() {
       const body = await resp.json();
       const executions = body.data || [];
       
-      // 🎯 Filtrer pour exclure "MCP Server" et prendre le workflow parent "Agent Discovery"
-      const mainExec = executions.find(e => {
+      // 🎯 RÈGLE STRICTE : Exclure "MCP Server" et prendre l'exécution Parent (mode webhook/manual)
+      const parentExec = executions.find(e => {
         const name = (e.workflowData?.name || "").toLowerCase();
-        return !name.includes("mcp server") && (name.includes("agent") || e.mode === "webhook" || e.mode === "manual");
+        const isSub = name.includes("mcp server") || e.mode === "subworkflow" || e.mode === "integrated";
+        return !isSub && (name.includes("agent") || e.mode === "webhook" || e.mode === "manual");
       }) || executions.find(e => !(e.workflowData?.name || "").toLowerCase().includes("mcp server"));
 
-      if (mainExec) {
-        console.log(`[proxy] Workflow Racine identifié via API n8n : #${mainExec.id} (${mainExec.workflowData?.name})`);
-        return deriveTraceId(mainExec.id);
+      if (parentExec) {
+        console.log(`[proxy] Workflow Parent RACINE identifié : #${parentExec.id} (${parentExec.workflowData?.name})`);
+        return deriveTraceId(parentExec.id);
       }
     }
   } catch (e) {
@@ -55,7 +54,6 @@ let lastUsage = {};
 const server = http.createServer(async (req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
-  // Health checks
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ status: 'ok' }));
@@ -84,24 +82,24 @@ const server = http.createServer(async (req, res) => {
   let incomingTraceparent = req.headers['traceparent'];
   let traceId = null;
 
-  // 1️⃣ Si un traceparent provient du premier appel Chat/LLM du workflow principal
+  // 1️⃣ Si un traceparent entrant existe (provenant de n8n)
   if (incomingTraceparent) {
     const parts = incomingTraceparent.split("-");
     if (parts.length >= 4) {
       traceId = parts[1];
       lockedMainTraceId = traceId;
       lastLockTime = now;
-      console.log(`[proxy] Trace Racine verrouillée : ${traceId}`);
+      console.log(`[proxy] Trace Racine verrouillée via header entrant : ${traceId}`);
     }
   }
 
   // 2️⃣ Si pas de traceparent (ex: /mcp-proxy), réutiliser la Trace Racine verrouillée
   if (!traceId && lockedMainTraceId && (now - lastLockTime < LOCK_TTL_MS)) {
     traceId = lockedMainTraceId;
-    console.log(`[proxy] Injection du Trace ID Racine sur la requête MCP : ${traceId}`);
+    console.log(`[proxy] Injection du Trace ID Racine sur l'appel MCP : ${traceId}`);
   }
 
-  // 3️⃣ En dernier recours, interroger n8n pour trouver Agent Discovery
+  // 3️⃣ En dernier recours, chercher l'exécution parent Agent Discovery dans l'API n8n
   if (!traceId) {
     traceId = await resolveMainWorkflowTraceId();
     if (traceId) {
@@ -141,7 +139,6 @@ const server = http.createServer(async (req, res) => {
     console.log(`→ Kong Chat: ${targetPath}`);
   }
 
-  // 🔹 Envoi du header UNIFIÉ à Kong et déclenchement de la télémétrie
   const unifiedTraceparent = `00-${traceId}-${derivedSpanId}-01`;
   const headers = {...req.headers};
   delete headers['authorization'];
