@@ -26,7 +26,7 @@ function parseHeaders(raw) {
   return result;
 }
 
-// ── Détecteurs de nœuds ───────────────────────────────────────────────────────
+// ── Détecteurs mutuellement exclusifs ─────────────────────────────────────────
 function isEmbeddingsNode(node) {
   const t = (node.nodeType || "").toLowerCase();
   const n = (node.nodeName || "").toLowerCase();
@@ -276,7 +276,7 @@ async function waitForExecutionToFinish(executionId, maxAttempts = 40) {
   return null;
 }
 
-// 🔹 Export avec liaisons parent-enfant explicites
+// 🔹 Export avec liaisons parent-enfant sous la racine unique
 async function buildAndExportUnifiedSpans(allParsed, traceId) {
   const mainParsed = allParsed[0];
   const { parent: mainParent } = mainParsed;
@@ -326,9 +326,8 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
 
     const nodeKey = `${node.workflowName}_${node.nodeName}_${node.executionIndex}_${node.runIndex}`;
 
-    // 🔹 Recherche dynamique des contextes parents
     const findCtx = (predicate) => {
-      const entry = Array.from(spanContextMap.entries()).find(([key, ctx]) => {
+      const entry = Array.from(spanContextMap.entries()).find(([key]) => {
         const matchingNode = allNodes.find(n => `${n.workflowName}_${n.nodeName}_${n.executionIndex}_${n.runIndex}` === key);
         return matchingNode && predicate(matchingNode);
       });
@@ -342,7 +341,7 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
 
     let parentSpanContext = null;
 
-    // 🌳 RÈGLES DE L'ARBRE DE TRACE (HIÉRARCHIE)
+    // 🌳 RÈGLES D'EMBOÎTEMENT DES NŒUDS
     if (isMcpClientNode(node) || isLlmNode(node)) {
       parentSpanContext = agentCtx;
     } else if (isMcpTriggerNode(node)) {
@@ -403,7 +402,7 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
   rootSpan.end(maxEndMs);
 
   if (provider) await provider.forceFlush();
-  console.log(`[otel] Exportation réussie de l'arbre complet pour [Parent #${mainParent.executionId}] | trace_id=${traceId}`);
+  console.log(`[otel] Arbre complet exporté pour [Parent #${mainParent.executionId}] | trace_id=${traceId}`);
 }
 
 async function processTraceparentAsync(traceparentHeader) {
