@@ -54,10 +54,6 @@ function isAgentNode(node) {
   return t.includes("agent") || n.includes("agent");
 }
 
-function isSubNode(node) {
-  return isEmbeddingsNode(node) || isVectorNode(node) || isLlmNode(node);
-}
-
 let forcedTraceId = null;
 let forcedNextSpanId = null;
 
@@ -257,7 +253,6 @@ function parseExecution(detail) {
   return { parent, nodes };
 }
 
-// 🔹 Attente active de la fin d'une exécution n8n
 async function waitForExecutionToFinish(executionId, maxAttempts = 40) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
@@ -269,7 +264,6 @@ async function waitForExecutionToFinish(executionId, maxAttempts = 40) {
   return null;
 }
 
-// 🔹 Export unifié de toutes les exécutions (Parent + Sous-workflows)
 async function buildAndExportUnifiedSpans(allParsed, traceId) {
   const mainParsed = allParsed[0];
   const { parent: mainParent } = mainParsed;
@@ -425,7 +419,6 @@ async function processTraceparentAsync(traceparentHeader) {
       return;
     }
 
-    // 🔹 Recherche automatique des sous-exécutions adjacentes (#parentExecutionId + 1, + 2)
     const parentStartMs = Date.parse(parentDetail.startedAt);
     const parentEndMs = Date.parse(parentDetail.stoppedAt);
     const allParsed = [parseExecution(parentDetail)];
