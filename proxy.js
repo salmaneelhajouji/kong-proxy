@@ -6,52 +6,19 @@ setupTracer();
 
 const traceCallCounters = new Map();
 
-let lockedMainTraceId = null;
-let lastLockTime = 0;
-const LOCK_TTL_MS = 3 * 60 * 1000; // Valide 3 minutes par exécution de workflow
-
-function deriveTraceId(seed) {
-  return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
-}
+// 🔹 Mémoire stricte du Trace ID Racine (Agent Discovery)
+let currentAgentTraceId = null;
+let currentAgentTraceparent = null;
+let lastAgentActivityTime = 0;
+const AGENT_TIMEOUT_MS = 2 * 60 * 1000; // Garde le verrou 2 minutes max
 
 function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Résolution stricte : On ignore tout sous-workflow MCP Server
-async function resolveMainWorkflowTraceId() {
-  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) return null;
-
-  try {
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=15`;
-    const resp = await fetch(url, {
-      headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
-    });
-    if (resp.ok) {
-      const body = await resp.json();
-      const executions = body.data || [];
-      
-      // 🎯 RÈGLE STRICTE : Exclure "MCP Server" et prendre l'exécution Parent (mode webhook/manual)
-      const parentExec = executions.find(e => {
-        const name = (e.workflowData?.name || "").toLowerCase();
-        const isSub = name.includes("mcp server") || e.mode === "subworkflow" || e.mode === "integrated";
-        return !isSub && (name.includes("agent") || e.mode === "webhook" || e.mode === "manual");
-      }) || executions.find(e => !(e.workflowData?.name || "").toLowerCase().includes("mcp server"));
-
-      if (parentExec) {
-        console.log(`[proxy] Workflow Parent RACINE identifié : #${parentExec.id} (${parentExec.workflowData?.name})`);
-        return deriveTraceId(parentExec.id);
-      }
-    }
-  } catch (e) {
-    console.error("[proxy] Erreur de résolution du workflow racine:", e.message);
-  }
-  return null;
-}
-
 let lastUsage = {};
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
 
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
@@ -82,32 +49,28 @@ const server = http.createServer(async (req, res) => {
   let incomingTraceparent = req.headers['traceparent'];
   let traceId = null;
 
-  // 1️⃣ Si un traceparent entrant existe (provenant de n8n)
+  // 1️⃣ CAS 1 : Requête avec traceparent (Premier appel Chat Gemini venant de Agent Discovery)
   if (incomingTraceparent) {
     const parts = incomingTraceparent.split("-");
     if (parts.length >= 4) {
       traceId = parts[1];
-      lockedMainTraceId = traceId;
-      lastLockTime = now;
-      console.log(`[proxy] Trace Racine verrouillée via header entrant : ${traceId}`);
+      // On MÉMORISE et VERROUILLE cet ID comme étant le seul et unique ID de l'agent en cours
+      currentAgentTraceId = traceId;
+      currentAgentTraceparent = incomingTraceparent;
+      lastAgentActivityTime = now;
+      console.log(`[proxy] 🟢 Trace Racine VERROUILLÉE depuis l'agent: ${traceId}`);
     }
-  }
-
-  // 2️⃣ Si pas de traceparent (ex: /mcp-proxy), réutiliser la Trace Racine verrouillée
-  if (!traceId && lockedMainTraceId && (now - lastLockTime < LOCK_TTL_MS)) {
-    traceId = lockedMainTraceId;
-    console.log(`[proxy] Injection du Trace ID Racine sur l'appel MCP : ${traceId}`);
-  }
-
-  // 3️⃣ En dernier recours, chercher l'exécution parent Agent Discovery dans l'API n8n
-  if (!traceId) {
-    traceId = await resolveMainWorkflowTraceId();
-    if (traceId) {
-      lockedMainTraceId = traceId;
-      lastLockTime = now;
-    } else {
-      traceId = crypto.randomBytes(16).toString("hex");
-    }
+  } 
+  // 2️⃣ CAS 2 : Requête SANS traceparent (Appel de MCP Client1 vers /mcp-proxy)
+  else if (currentAgentTraceId && (now - lastAgentActivityTime < AGENT_TIMEOUT_MS)) {
+    // On FORCE la réutilisation du Trace ID de l'Agent Discovery
+    traceId = currentAgentTraceId;
+    lastAgentActivityTime = now; // On prolonge l'activité
+    console.log(`[proxy] 🔵 Réinjection forcée du Trace ID Racine sur MCP Client1: ${traceId}`);
+  } 
+  // 3️⃣ CAS 3 : Aucun agent actif
+  else {
+    traceId = crypto.randomBytes(16).toString("hex");
   }
 
   if (!traceCallCounters.has(traceId)) {
@@ -126,17 +89,14 @@ const server = http.createServer(async (req, res) => {
     targetPath = req.url;
     derivedSpanId = deriveSpanId(traceId + `-mcp-${counters.mcp}`);
     counters.mcp++;
-    console.log(`→ Kong MCP Proxy: ${targetPath}`);
   } else if (isEmbedding) {
     targetPath = '/ai-api/v1/embeddings';
     derivedSpanId = deriveSpanId(traceId + `-embeddings-${counters.embedding}`);
     counters.embedding++;
-    console.log(`→ Kong Embeddings: ${targetPath}`);
   } else {
     targetPath = '/ai-api/v1/chat/gemini';
     derivedSpanId = deriveSpanId(traceId + `-chat-${counters.chat}`);
     counters.chat++;
-    console.log(`→ Kong Chat: ${targetPath}`);
   }
 
   const unifiedTraceparent = `00-${traceId}-${derivedSpanId}-01`;
@@ -146,7 +106,7 @@ const server = http.createServer(async (req, res) => {
   delete headers['accept-encoding'];
 
   headers['traceparent'] = unifiedTraceparent;
-  console.log(`→ Header traceparent UNIFIÉ transmis à Kong: ${unifiedTraceparent}`);
+  console.log(`→ Header transmis à Kong: ${unifiedTraceparent}`);
 
   triggerTraceFromTraceparent(unifiedTraceparent);
 
@@ -170,7 +130,6 @@ const server = http.createServer(async (req, res) => {
                               reqJson.messages.some(m => m.role === 'tool');
 
         if (hasToolResult) {
-          console.log(`→ Détection 2ème appel avec tool results`);
           const systemMsg = reqJson.messages.find(m => m.role === 'system');
           const userMsg   = reqJson.messages.find(m => m.role === 'user');
           const toolResults = reqJson.messages
@@ -206,9 +165,7 @@ const server = http.createServer(async (req, res) => {
         const correctedBody = JSON.stringify(reqJson);
         reqBody = Buffer.from(correctedBody);
 
-      } catch(e) {
-        console.log(`→ Body non-JSON`);
-      }
+      } catch(e) {}
     }
 
     const options = {
@@ -223,7 +180,6 @@ const server = http.createServer(async (req, res) => {
     const proxy = https.request(options, (proxyRes) => {
       const requestEndTime = Date.now();
       const realLatencyMs = requestEndTime - requestStartTime;
-      console.log(`← Kong status: ${proxyRes.statusCode} | Latence réelle: ${realLatencyMs}ms`);
 
       let chunks = [];
       proxyRes.on('data', chunk => chunks.push(chunk));
@@ -267,7 +223,6 @@ const server = http.createServer(async (req, res) => {
     });
 
     proxy.on("error", (e) => {
-      console.log(`← Erreur: ${e.message}`);
       res.writeHead(500);
       res.end(e.message);
     });
