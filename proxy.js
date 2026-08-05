@@ -6,12 +6,9 @@ setupTracer();
 
 const traceCallCounters = new Map();
 
-let activeAgentTraceId = null;
-let lastAgentActivityTime = 0;
-const AGENT_LOCK_TTL_MS = 2 * 60 * 1000;
-
-const workflowNameCache = new Map();
-let lastWfCacheTime = 0;
+let lockedAgentTraceId = null;
+let lastLockTime = 0;
+const AGENT_LOCK_TTL_MS = 3 * 60 * 1000;
 
 function deriveTraceId(seed) {
   return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
@@ -21,76 +18,24 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Rafraîchissement du cache des workflows n8n
-async function refreshWorkflowCache() {
-  const now = Date.now();
-  if (workflowNameCache.size > 0 && (now - lastWfCacheTime < 60000)) return;
-  try {
-    const resp = await fetch(`${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/workflows`, {
-      headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
-    });
-    if (resp.ok) {
-      const body = await resp.json();
-      (body.data || []).forEach(w => workflowNameCache.set(w.id, w.name));
-      lastWfCacheTime = now;
-    }
-  } catch (e) {
-    console.error("[proxy] Erreur rafraîchissement workflows:", e.message);
-  }
-}
-
-// 🔹 Récupération immédiate de la TOUTE DERNIÈRE exécution parent (même statut 'running')
-async function getOrFetchParentTraceId() {
-  const now = Date.now();
-  
-  if (activeAgentTraceId && (now - lastAgentActivityTime < AGENT_LOCK_TTL_MS)) {
-    lastAgentActivityTime = now;
-    return activeAgentTraceId;
-  }
-
-  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) {
-    return crypto.randomBytes(16).toString("hex");
-  }
-
-  try {
-    await refreshWorkflowCache();
-
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
-    const resp = await fetch(url, {
-      headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
-    });
-    if (resp.ok) {
-      const body = await resp.json();
-      const executions = body.data || [];
-      
-      // 🎯 Sélectionner la toute plus récente exécution (statut running inclus) qui N'EST PAS un MCP Server
-      const parentExec = executions.find(e => {
-        const wfName = (workflowNameCache.get(e.workflowId) || "").toLowerCase();
-        return (wfName.includes("agent") || e.mode === "webhook" || e.mode === "manual") && !wfName.includes("mcp server");
-      }) || executions.find(e => {
-        const wfName = (workflowNameCache.get(e.workflowId) || "").toLowerCase();
-        return !wfName.includes("mcp server");
-      }) || executions[0];
-
-      if (parentExec) {
-        const wfName = workflowNameCache.get(parentExec.workflowId) || "Agent Discovery";
-        activeAgentTraceId = deriveTraceId(parentExec.id);
-        lastAgentActivityTime = now;
-        console.log(`[proxy] 🟢 Sync direct avec l'exécution RÉELLE #${parentExec.id} (${wfName}) -> trace_id: ${activeAgentTraceId}`);
-        return activeAgentTraceId;
-      }
-    }
-  } catch (e) {
-    console.error("[proxy] Erreur de récupération execution n8n:", e.message);
-  }
-
-  return crypto.randomBytes(16).toString("hex");
-}
-
 let lastUsage = {};
 
 const server = http.createServer(async (req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
+
+  // 🎯 Endpoint d'enregistrement immédiat de l'exécution active depuis n8n
+  if (req.url.startsWith('/register-execution')) {
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    const execId = urlObj.searchParams.get('id');
+    if (execId) {
+      lockedAgentTraceId = deriveTraceId(execId);
+      lastLockTime = Date.now();
+      console.log(`[proxy] ⚡ Signal reçu de n8n! Verrouillage direct sur Exécution #${execId} -> trace_id: ${lockedAgentTraceId}`);
+    }
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({ status: 'registered' }));
+    return;
+  }
 
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
@@ -116,7 +61,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const traceId = await getOrFetchParentTraceId();
+  const now = Date.now();
+  let traceId = null;
+
+  if (lockedAgentTraceId && (now - lastLockTime < AGENT_LOCK_TTL_MS)) {
+    traceId = lockedAgentTraceId;
+    lastLockTime = now;
+  } else {
+    traceId = crypto.randomBytes(16).toString("hex");
+  }
 
   if (!traceCallCounters.has(traceId)) {
     traceCallCounters.set(traceId, { chat: 0, embedding: 0, mcp: 0 });
