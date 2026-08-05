@@ -13,6 +13,8 @@ const PUBLIC_PROXY_URL = process.env.RENDER_EXTERNAL_URL || "https://kong-proxy.
 const REVERSE_SEARCH_RANGE = parseInt(process.env.REVERSE_SEARCH_RANGE || "300", 10);
 const MAX_ATTR_LENGTH = parseInt(process.env.MAX_ATTR_LENGTH || "8000", 10);
 
+const MCP_SERVER_WORKFLOW_ID = "BMxUfKVV5C0rvQzo";
+
 function parseHeaders(raw) {
   const result = {};
   if (!raw.trim()) return result;
@@ -132,27 +134,44 @@ async function fetchLatestExecutionId() {
   return latest ? parseInt(latest, 10) : null;
 }
 
+// 🔹 Résolution d'ID avec Fallback Garanti pour capturer les nœuds
 async function resolveExecutionIdFromTraceId(traceId) {
   try {
     const latest = await fetchLatestExecutionId();
     if (latest) lastKnownExecutionId = latest;
   } catch (e) {
-    console.error(`[otel] Impossible de rafraîchir le dernier execution_id:`, e.message);
+    console.error(`[otel] Erreur rafraîchissement execution_id:`, e.message);
   }
 
-  if (!lastKnownExecutionId) return null;
+  if (lastKnownExecutionId) {
+    const upperBound = lastKnownExecutionId + 20;
+    const lowerBound = Math.max(1, lastKnownExecutionId - REVERSE_SEARCH_RANGE);
 
-  const upperBound = lastKnownExecutionId + 20;
-  const lowerBound = Math.max(1, lastKnownExecutionId - REVERSE_SEARCH_RANGE);
-
-  for (let candidate = upperBound; candidate >= lowerBound; candidate--) {
-    if (deriveTraceId(candidate) === traceId) {
-      lastKnownExecutionId = Math.max(lastKnownExecutionId, candidate);
-      return candidate;
+    for (let candidate = upperBound; candidate >= lowerBound; candidate--) {
+      if (deriveTraceId(candidate) === traceId) {
+        lastKnownExecutionId = Math.max(lastKnownExecutionId, candidate);
+        return candidate;
+      }
     }
   }
 
-  console.warn(`[otel] Aucun execution_id trouvé pour trace_id=${traceId}`);
+  // Fallback direct sur l'exécution parent
+  try {
+    const url = `${N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
+    const resp = await fetch(url, {
+      headers: { "X-N8N-API-KEY": N8N_API_KEY, "Accept": "application/json" }
+    });
+    if (resp.ok) {
+      const body = await resp.json();
+      const executions = body.data || [];
+      const parentExec = executions.find(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID) || executions[0];
+      if (parentExec) {
+        console.log(`[otel] 🟢 Fallback : Raccordement sur Exécution Parent #${parentExec.id}`);
+        return parseInt(parentExec.id, 10);
+      }
+    }
+  } catch (e) {}
+
   return null;
 }
 
@@ -274,7 +293,6 @@ async function waitForExecutionToFinish(executionId, maxAttempts = 40) {
   return null;
 }
 
-// 🔹 Exportation complète des tous les nœuds n8n sous l'arbre parent
 async function buildAndExportUnifiedSpans(allParsed, traceId) {
   const mainParsed = allParsed[0];
   const { parent: mainParent } = mainParsed;
