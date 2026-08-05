@@ -1,3 +1,4 @@
+// proxy.js
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
@@ -9,7 +10,7 @@ const traceCallCounters = new Map();
 let activeExecutionId = null;
 let activeTraceId = null;
 let lastRegisterTime = 0;
-const LOCK_TTL_MS = 2 * 60 * 1000; // Verrou de 2 minutes par exécution
+const LOCK_TTL_MS = 2 * 60 * 1000;
 
 const MCP_SERVER_WORKFLOW_ID = "BMxUfKVV5C0rvQzo";
 
@@ -21,11 +22,8 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Détection et Prédiction Intelligente de l'Exécution Parent Active
 async function getParentExecutionTraceId() {
   const now = Date.now();
-  
-  // 1. Si une exécution a été verrouillée il y a moins de 2 minutes, conserver son trace_id
   if (activeTraceId && (now - lastRegisterTime < LOCK_TTL_MS)) {
     return { traceId: activeTraceId, execId: activeExecutionId };
   }
@@ -43,46 +41,32 @@ async function getParentExecutionTraceId() {
       const executions = body.data || [];
       if (executions.length === 0) return null;
 
-      // A. Vérifier si n8n signale déjà une exécution "running"
       const runningParent = executions.find(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID && (e.status === 'running' || !e.stoppedAt));
       if (runningParent) {
         activeExecutionId = String(runningParent.id);
         activeTraceId = deriveTraceId(activeExecutionId);
         lastRegisterTime = now;
-        console.log(`[proxy] 🟢 EXÉCUTION EN COURS DÉTECTÉE -> #${activeExecutionId}`);
         return { traceId: activeTraceId, execId: activeExecutionId };
       }
 
-      // B. Trouver l'ID le plus élevé absolu dans la base de données (Parent ou Sub-workflow)
       const sortedAll = [...executions].sort((a, b) => Number(b.id) - Number(a.id));
       const maxExec = sortedAll[0];
       const maxId = Number(maxExec.id);
       const stoppedTime = maxExec.stoppedAt ? Date.parse(maxExec.stoppedAt) : now;
 
-      // C. Prédiction Mathématique : Si la dernière exécution est terminée depuis > 3 secondes,
-      // la requête entrante appartient à la NOUVELLE exécution qui démarre !
       if (now - stoppedTime > 3000) {
-        let predictedParentId;
-        if (maxExec.workflowId === MCP_SERVER_WORKFLOW_ID) {
-          predictedParentId = maxId + 1; // Ex: #12536 (Sub) -> #12537 (Parent)
-        } else {
-          predictedParentId = maxId + 2; // Ex: #12535 (Parent) -> #12537 (Parent)
-        }
-
+        let predictedParentId = maxExec.workflowId === MCP_SERVER_WORKFLOW_ID ? maxId + 1 : maxId + 2;
         activeExecutionId = String(predictedParentId);
         activeTraceId = deriveTraceId(activeExecutionId);
         lastRegisterTime = now;
-        console.log(`[proxy] ⚡ PRÉDICTION NOUVELLE EXÉCUTION -> Parent #${activeExecutionId} (Dernière connue en BDD: #${maxId})`);
         return { traceId: activeTraceId, execId: activeExecutionId };
       }
 
-      // D. Fallback si terminée à l'instant
       const parentExecs = executions.filter(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID).sort((a, b) => Number(b.id) - Number(a.id));
       if (parentExecs.length > 0) {
         activeExecutionId = String(parentExecs[0].id);
         activeTraceId = deriveTraceId(activeExecutionId);
         lastRegisterTime = now;
-        console.log(`[proxy] 🟢 DERNIER PARENT -> #${activeExecutionId}`);
         return { traceId: activeTraceId, execId: activeExecutionId };
       }
     }
@@ -123,7 +107,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 2. RÉSOLUTION DYNAMIQUE DE L'EXÉCUTION ACTIVE
   const syncInfo = await getParentExecutionTraceId();
   let traceId = syncInfo ? syncInfo.traceId : crypto.randomBytes(16).toString("hex");
   let execId = syncInfo ? syncInfo.execId : "unknown";
@@ -142,15 +125,18 @@ const server = http.createServer(async (req, res) => {
 
   if (isMcp) {
     targetPath = reqUrl.split('?')[0];
-    parentSpanId = deriveSpanId(`${execId}_node_MCP Client1`);
+    // Rattaché sous le nœud MCP Client1
+    parentSpanId = deriveSpanId(`${execId}_node_MCP Client1_${counters.mcp}`);
     counters.mcp++;
   } else if (isEmbedding) {
     targetPath = '/ai-api/v1/embeddings';
-    parentSpanId = deriveSpanId(`${execId}_node_Pinecone Vector Store`);
+    // Rattaché sous Pinecone Vector Store
+    parentSpanId = deriveSpanId(`${execId}_node_Pinecone Vector Store_${counters.embedding}`);
     counters.embedding++;
   } else {
     targetPath = '/ai-api/v1/chat/gemini';
-    parentSpanId = deriveSpanId(`${execId}_node_AI Agent`);
+    // 🎯 RATTACHEMENT DIRECT SOUS LE NŒUD LLM (LLM_0 pour l'appel 1, LLM_1 pour l'appel 2)
+    parentSpanId = deriveSpanId(`${execId}_node_LLM_${counters.chat}`);
     counters.chat++;
   }
 
@@ -237,7 +223,6 @@ const server = http.createServer(async (req, res) => {
               };
             }
 
-            // Reconversion Float32LE -> Base64 pour n8n Embeddings OpenAI
             if (json.data && isEmbedding && Array.isArray(json.data[0]?.embedding)) {
               const emb = json.data[0].embedding;
               const buffer = Buffer.allocUnsafe(emb.length * 4);
