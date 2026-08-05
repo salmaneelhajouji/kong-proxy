@@ -21,7 +21,7 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Fallback via l'API n8n si aucun exec_id n'est présent dans l'URL
+// 🔹 Fallback via API n8n si aucun ID valide n'est fourni
 async function getParentExecutionTraceId() {
   const now = Date.now();
   if (activeTraceId && (now - lastRegisterTime < LOCK_TTL_MS)) {
@@ -63,18 +63,22 @@ const server = http.createServer(async (req, res) => {
   const reqUrl = req.url || "/";
   console.log(`→ ${req.method} ${reqUrl}`);
 
-  // 1. EXTRACTION DIRECTE ET SANS ERREUR DE EXEC_ID DEPUIS L'URL ENTRANTE
+  // 1. EXTRACTION ET NETTOYAGE STRICT DE L'EXEC_ID (Extrait uniquement les chiffres)
   const parsedUrl = new URL(reqUrl, `http://${req.headers.host || 'localhost'}`);
-  const directExecId = parsedUrl.searchParams.get('exec_id') || parsedUrl.searchParams.get('id');
+  let rawExecId = parsedUrl.searchParams.get('exec_id') || parsedUrl.searchParams.get('id');
 
-  if (directExecId) {
-    activeExecutionId = String(directExecId);
-    activeTraceId = deriveTraceId(activeExecutionId);
-    lastRegisterTime = Date.now();
-    console.log(`[proxy] 🎯 EXEC_ID DÉTECTÉ EN DIRECT -> #${activeExecutionId} | trace_id: ${activeTraceId}`);
+  if (rawExecId) {
+    // Ne garder que la partie numérique de l'ID (élimine les /chat/completions ou {{...}} non évalués)
+    const cleanIdMatch = rawExecId.match(/\d+/);
+    if (cleanIdMatch) {
+      activeExecutionId = cleanIdMatch[0];
+      activeTraceId = deriveTraceId(activeExecutionId);
+      lastRegisterTime = Date.now();
+      console.log(`[proxy] 🎯 EXEC_ID NETTOYÉ EN DIRECT -> #${activeExecutionId} | trace_id: ${activeTraceId}`);
+    }
   }
 
-  if (reqUrl.includes('/register-execution') && directExecId) {
+  if (reqUrl.includes('/register-execution') && activeExecutionId) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'registered', executionId: activeExecutionId, traceId: activeTraceId }));
     return;
@@ -104,7 +108,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 2. RÉSOLVEUR DE TRACE
+  // 2. RÉSOLVEUR DE TRACE UNIFIÉE
   let traceId = activeTraceId;
   let execId = activeExecutionId;
 
@@ -127,7 +131,7 @@ const server = http.createServer(async (req, res) => {
   let targetPath;
 
   if (isMcp) {
-    targetPath = reqUrl;
+    targetPath = reqUrl.split('?')[0]; // Supprime les paramètres de requête pour Kong
     parentSpanId = deriveSpanId(`${execId}_node_MCP Client1`);
     counters.mcp++;
   } else if (isEmbedding) {
@@ -209,6 +213,7 @@ const server = http.createServer(async (req, res) => {
       proxyRes.on('data', chunk => chunks.push(chunk));
       proxyRes.on('end', () => {
         const body = Buffer.concat(chunks);
+        
         if (!isMcp) {
           try {
             const json = JSON.parse(body.toString());
@@ -221,17 +226,10 @@ const server = http.createServer(async (req, res) => {
                 model: json.model
               };
             }
-            if (json.data && isEmbedding && Array.isArray(json.data[0]?.embedding)) {
-              const emb = json.data[0].embedding;
-              const buffer = Buffer.allocUnsafe(emb.length * 4);
-              emb.forEach((val, i) => buffer.writeFloatLE(val, i * 4));
-              json.data[0].embedding = buffer.toString('base64');
-              res.writeHead(proxyRes.statusCode, proxyRes.headers);
-              res.end(JSON.stringify(json));
-              return;
-            }
           } catch(e) {}
         }
+
+        // Transmettre la réponse brute à n8n (Intact Float Array pour Pinecone)
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
         res.end(body);
       });
