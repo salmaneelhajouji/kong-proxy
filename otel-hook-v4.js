@@ -274,6 +274,7 @@ async function waitForExecutionToFinish(executionId, maxAttempts = 40) {
   return null;
 }
 
+// 🔹 Exportation complète des tous les nœuds n8n sous l'arbre parent
 async function buildAndExportUnifiedSpans(allParsed, traceId) {
   const mainParsed = allParsed[0];
   const { parent: mainParent } = mainParsed;
@@ -398,7 +399,7 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
   rootSpan.end(maxEndMs);
 
   if (provider) await provider.forceFlush();
-  console.log(`[otel] Arbre complet exporté pour [Parent #${mainParent.executionId}] | trace_id=${traceId}`);
+  console.log(`[otel] 🚀 Succès : Tous les nœuds n8n ont été exportés sous [Exécution #${mainParent.executionId}] | trace_id=${traceId}`);
 }
 
 async function processTraceparentAsync(traceparentHeader) {
@@ -410,7 +411,7 @@ async function processTraceparentAsync(traceparentHeader) {
     const parentExecutionId = await resolveExecutionIdFromTraceId(traceId);
     if (!parentExecutionId) return;
 
-    console.log(`[otel] Attente active du workflow parent #${parentExecutionId}...`);
+    console.log(`[otel] Attente active de l'exécution parent #${parentExecutionId}...`);
 
     const renderKeepAliveTimer = setInterval(() => {
       fetch(`${PUBLIC_PROXY_URL}/`).catch(() => {});
