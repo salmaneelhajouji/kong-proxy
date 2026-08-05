@@ -72,7 +72,7 @@ function setupTracer() {
   provider.register();
 
   tracer = trace.getTracer("n8n-webhook-hook");
-  console.log(`[otel] Tracer initialisé (Arbre Hiérarchique Parfait) -> ${OTEL_ENDPOINT}`);
+  console.log(`[otel] Tracer initialisé -> ${OTEL_ENDPOINT}`);
 }
 
 function deriveTraceId(seed) {
@@ -245,15 +245,14 @@ async function waitForExecutionToFinish(executionId, maxAttempts = 40) {
   return null;
 }
 
-// 🔹 DÉFINITION DE LA HIÉRARCHIE STRICTE
 function getNodeRank(nodeName) {
   const name = (nodeName || "").trim();
-  if (name === "AI Agent") return 1;                   // NIVEAU 1 : Reçoit tout
-  if (name === "LLM" || name === "MCP Client1") return 2; // NIVEAU 2 : Sous AI Agent
-  if (name === "MCP Server Trigger") return 3;         // NIVEAU 3 : Sous MCP Client1
-  if (name === "Pinecone Vector Store") return 4;      // NIVEAU 4 : Sous MCP Server Trigger
-  if (name === "Embeddings OpenAI") return 5;          // NIVEAU 5 : Sous Pinecone
-  return 0;                                            // NIVEAU 0 : Webhook, Code, Loop, Wait...
+  if (name === "AI Agent") return 1;
+  if (name === "LLM" || name === "MCP Client1") return 2;
+  if (name === "MCP Server Trigger") return 3;
+  if (name === "Pinecone Vector Store") return 4;
+  if (name === "Embeddings OpenAI") return 5;
+  return 0;
 }
 
 async function buildAndExportUnifiedSpans(allParsed, traceId) {
@@ -265,7 +264,6 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     allNodes.push(...parsed.nodes);
   });
 
-  // 🚀 TRI PAR RANG HIÉRARCHIQUE : AI Agent est TOUJOURS créé en premier
   allNodes.sort((a, b) => {
     const rankA = getNodeRank(a.nodeName);
     const rankB = getNodeRank(b.nodeName);
@@ -301,6 +299,7 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
 
   allNodes.forEach(node => {
     const nodeName = node.nodeName;
+    const runIndex = node.runIndex || 0;
     const durationMs = Math.max(node.durationMs || 1, 1);
     let nodeStartMs = node.startTimeMs || startMs;
     let nodeEndMs = nodeStartMs + durationMs;
@@ -308,35 +307,27 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     if (nodeStartMs < startMs) nodeStartMs = startMs;
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
-    forcedNextSpanId = deriveSpanId(`${node.executionId}_node_${nodeName}`);
+    // 🎯 ID DÉTERMINISTE UNIQUE DÉRIVÉ AVEC LE RUN_INDEX
+    forcedNextSpanId = deriveSpanId(`${node.executionId}_node_${nodeName}_${runIndex}`);
 
-    // 🎯 ASSIGNATION STRICTE DES PARENTS DANS L'ARBRE
     let parentCtxToUse = rootCtx;
 
     if (nodeName === "LLM" || nodeName === "MCP Client1") {
-      const agentCtx = spanContextMap.get("AI Agent");
+      const agentCtx = spanContextMap.get("AI Agent_0") || spanContextMap.get("AI Agent");
       if (agentCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(agentCtx));
     } else if (nodeName === "MCP Server Trigger") {
-      const mcpClientCtx = spanContextMap.get("MCP Client1");
+      const mcpClientCtx = spanContextMap.get(`MCP Client1_${runIndex}`) || spanContextMap.get("MCP Client1_0") || spanContextMap.get("MCP Client1");
       if (mcpClientCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(mcpClientCtx));
       else {
-        const agentCtx = spanContextMap.get("AI Agent");
+        const agentCtx = spanContextMap.get("AI Agent_0") || spanContextMap.get("AI Agent");
         if (agentCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(agentCtx));
       }
     } else if (nodeName === "Pinecone Vector Store") {
-      const triggerCtx = spanContextMap.get("MCP Server Trigger");
+      const triggerCtx = spanContextMap.get(`MCP Server Trigger_${runIndex}`) || spanContextMap.get("MCP Server Trigger_0") || spanContextMap.get("MCP Server Trigger");
       if (triggerCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(triggerCtx));
-      else {
-        const mcpClientCtx = spanContextMap.get("MCP Client1");
-        if (mcpClientCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(mcpClientCtx));
-      }
     } else if (nodeName === "Embeddings OpenAI") {
-      const vectorCtx = spanContextMap.get("Pinecone Vector Store");
+      const vectorCtx = spanContextMap.get(`Pinecone Vector Store_${runIndex}`) || spanContextMap.get("Pinecone Vector Store_0") || spanContextMap.get("Pinecone Vector Store");
       if (vectorCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(vectorCtx));
-      else {
-        const triggerCtx = spanContextMap.get("MCP Server Trigger");
-        if (triggerCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(triggerCtx));
-      }
     }
 
     const childSpan = tracer.startSpan(
@@ -359,6 +350,7 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     childSpan.setAttribute("n8n.execution.id", node.executionId);
     childSpan.setAttribute("n8n.workflow.name", node.workflowName);
     childSpan.setAttribute("n8n.node.name", nodeName);
+    childSpan.setAttribute("n8n.node.run_index", runIndex);
     childSpan.setAttribute("n8n.node.type", node.nodeType || "unknown");
     childSpan.setAttribute("n8n.node.duration_ms", durationMs);
 
@@ -366,6 +358,9 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     if (node.outputData) childSpan.setAttribute("output.value", truncate(node.outputData));
 
     childSpan.setStatus({ code: toOtelStatusCode(node.status) });
+
+    // Stockage du contexte sous les deux clés (indexée et générique)
+    spanContextMap.set(`${nodeName}_${runIndex}`, childSpan.spanContext());
     spanContextMap.set(nodeName, childSpan.spanContext());
 
     childSpan.end(nodeEndMs);
@@ -374,7 +369,7 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
   rootSpan.end(maxEndMs);
 
   if (provider) await provider.forceFlush();
-  console.log(`[otel] 🚀 Succès : Arbre hiérarchique parfait exporté sous [Exécution #${mainParent.executionId}] | trace_id=${traceId}`);
+  console.log(`[otel] 🚀 Succès : Arbre parfait exporté sous [Exécution #${mainParent.executionId}] | trace_id=${traceId}`);
 }
 
 async function processTraceparentAsync(traceparentHeader) {
