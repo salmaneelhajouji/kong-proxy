@@ -9,7 +9,7 @@ const traceCallCounters = new Map();
 let activeExecutionId = null;
 let activeTraceId = null;
 let lastRegisterTime = 0;
-const LOCK_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const LOCK_TTL_MS = 5 * 60 * 1000;
 
 const MCP_SERVER_WORKFLOW_ID = "BMxUfKVV5C0rvQzo";
 
@@ -21,8 +21,7 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Récupération dynamique de secours via l'API n8n (si le signal n'est pas encore arrivé)
-// 🔹 Récupération dynamique fiable de l'Exécution Parent n8n
+// 🔹 Fallback via l'API n8n si aucun exec_id n'est présent dans l'URL
 async function getParentExecutionTraceId() {
   const now = Date.now();
   if (activeTraceId && (now - lastRegisterTime < LOCK_TTL_MS)) {
@@ -32,7 +31,6 @@ async function getParentExecutionTraceId() {
   if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) return null;
 
   try {
-    // 1. Chercher prioritairement les exécutions actives ("running")
     const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
     const resp = await fetch(url, {
       headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
@@ -41,11 +39,7 @@ async function getParentExecutionTraceId() {
     if (resp.ok) {
       const body = await resp.json();
       const executions = body.data || [];
-
-      // Filtrer les exécutions du workflow MCP Server
       const parentExecutions = executions.filter(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID);
-
-      // Sélectionner en priorité une exécution "running", sinon la plus récente par ID (tri numérique décroissant)
       const activeRunning = parentExecutions.find(e => e.status === 'running');
       const latestExec = activeRunning || parentExecutions.sort((a, b) => Number(b.id) - Number(a.id))[0];
 
@@ -53,7 +47,6 @@ async function getParentExecutionTraceId() {
         activeExecutionId = String(latestExec.id);
         activeTraceId = deriveTraceId(activeExecutionId);
         lastRegisterTime = now;
-        console.log(`[proxy] 🟢 Sync API n8n -> Exécution Parent #${activeExecutionId} (Status: ${latestExec.status || 'finished'}) | trace_id: ${activeTraceId}`);
         return { traceId: activeTraceId, execId: activeExecutionId };
       }
     }
@@ -63,31 +56,28 @@ async function getParentExecutionTraceId() {
 
   return null;
 }
+
 let lastUsage = {};
 
 const server = http.createServer(async (req, res) => {
   const reqUrl = req.url || "/";
   console.log(`→ ${req.method} ${reqUrl}`);
 
-  // 1. ⚡ ENREGISTREMENT INSTANTANÉ & RÉINITIALISATION DU CACHE DE TRACE
-  if (reqUrl.includes('/register-execution')) {
-    const urlParams = new URLSearchParams(reqUrl.split('?')[1] || '');
-    const execId = urlParams.get('id');
+  // 1. EXTRACTION DIRECTE ET SANS ERREUR DE EXEC_ID DEPUIS L'URL ENTRANTE
+  const parsedUrl = new URL(reqUrl, `http://${req.headers.host || 'localhost'}`);
+  const directExecId = parsedUrl.searchParams.get('exec_id') || parsedUrl.searchParams.get('id');
 
-    if (execId) {
-      activeExecutionId = String(execId);
-      activeTraceId = deriveTraceId(activeExecutionId);
-      lastRegisterTime = Date.now();
+  if (directExecId) {
+    activeExecutionId = String(directExecId);
+    activeTraceId = deriveTraceId(activeExecutionId);
+    lastRegisterTime = Date.now();
+    console.log(`[proxy] 🎯 EXEC_ID DÉTECTÉ EN DIRECT -> #${activeExecutionId} | trace_id: ${activeTraceId}`);
+  }
 
-      // Suppression de tout état résiduel sur ce trace_id
-      traceCallCounters.delete(activeTraceId);
-
-      console.log(`[proxy] ⚡ SIGNAL REÇU - Exécution Verrouillée #${activeExecutionId} -> trace_id: ${activeTraceId}`);
-      
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'registered', executionId: activeExecutionId, traceId: activeTraceId }));
-      return;
-    }
+  if (reqUrl.includes('/register-execution') && directExecId) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'registered', executionId: activeExecutionId, traceId: activeTraceId }));
+    return;
   }
 
   if (req.method === 'HEAD' || reqUrl === '/' || reqUrl === '/health') {
@@ -114,10 +104,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 2. 🔀 PROXYING ET INJECTION W3C TRACEPARENT
-  const syncInfo = await getParentExecutionTraceId();
-  let traceId = syncInfo ? syncInfo.traceId : crypto.randomBytes(16).toString("hex");
-  let execId = syncInfo ? syncInfo.execId : "unknown";
+  // 2. RÉSOLVEUR DE TRACE
+  let traceId = activeTraceId;
+  let execId = activeExecutionId;
+
+  if (!traceId) {
+    const syncInfo = await getParentExecutionTraceId();
+    traceId = syncInfo ? syncInfo.traceId : crypto.randomBytes(16).toString("hex");
+    execId = syncInfo ? syncInfo.execId : "unknown";
+  }
 
   if (!traceCallCounters.has(traceId)) {
     traceCallCounters.set(traceId, { chat: 0, embedding: 0, mcp: 0 });
