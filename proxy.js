@@ -1,16 +1,16 @@
-const https = require("https");
 const http = require("http");
+const https = require("https");
 const crypto = require("crypto");
 const { setupTracer, triggerTraceFromTraceparent } = require("./otel-hook-v4.js");
+
 setupTracer();
 
 const traceCallCounters = new Map();
+let activeExecutionId = null;
+let activeTraceId = null;
+let lastRegisterTime = 0;
+const LOCK_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-let lockedAgentTraceId = null;
-let lastLockTime = 0;
-const AGENT_LOCK_TTL_MS = 3 * 60 * 1000; // 3 minutes
-
-// ID unique du workflow MCP Server (obtenu depuis les logs n8n)
 const MCP_SERVER_WORKFLOW_ID = "BMxUfKVV5C0rvQzo";
 
 function deriveTraceId(seed) {
@@ -21,22 +21,17 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Récupération propre et garantie du parent "Agent Discovery"
+// Récupération dynamique de secours via l'API n8n si aucun /register-execution n'a été reçu
 async function getParentExecutionTraceId() {
   const now = Date.now();
-  
-  if (lockedAgentTraceId && (now - lastLockTime < AGENT_LOCK_TTL_MS)) {
-    lastLockTime = now;
-    return lockedAgentTraceId;
+  if (activeTraceId && (now - lastRegisterTime < LOCK_TTL_MS)) {
+    return { traceId: activeTraceId, execId: activeExecutionId };
   }
 
-  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) {
-    return null;
-  }
+  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) return null;
 
   try {
-    // Appel propre sans query param invalide
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=5`;
     const resp = await fetch(url, {
       headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
     });
@@ -44,18 +39,15 @@ async function getParentExecutionTraceId() {
     if (resp.ok) {
       const body = await resp.json();
       const executions = body.data || [];
-
-      // Sélectionner l'exécution la plus récente du workflow principal (exclure MCP Server)
       const parentExec = executions.find(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID) || executions[0];
 
       if (parentExec) {
-        lockedAgentTraceId = deriveTraceId(parentExec.id);
-        lastLockTime = now;
-        console.log(`[proxy] 🟢 Sync direct avec Exécution Parent #${parentExec.id} -> trace_id: ${lockedAgentTraceId}`);
-        return lockedAgentTraceId;
+        activeExecutionId = String(parentExec.id);
+        activeTraceId = deriveTraceId(activeExecutionId);
+        lastRegisterTime = now;
+        console.log(`[proxy] 🟢 Sync API n8n -> Exécution Parent #${activeExecutionId} | trace_id: ${activeTraceId}`);
+        return { traceId: activeTraceId, execId: activeExecutionId };
       }
-    } else {
-      console.error(`[proxy] API n8n HTTP ${resp.status}`);
     }
   } catch (e) {
     console.error("[proxy] Erreur fetch executions n8n:", e.message);
@@ -67,21 +59,39 @@ async function getParentExecutionTraceId() {
 let lastUsage = {};
 
 const server = http.createServer(async (req, res) => {
-  console.log(`→ ${req.method} ${req.url}`);
+  const reqUrl = req.url || "/";
+  console.log(`→ ${req.method} ${reqUrl}`);
 
-  if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
+  // 1. Enregistrement instantané de l'execution_id parent dès la milliseconde 0
+  if (reqUrl.includes('/register-execution')) {
+    const urlParams = new URLSearchParams(reqUrl.split('?')[1] || '');
+    const execId = urlParams.get('id');
+
+    if (execId) {
+      activeExecutionId = String(execId);
+      activeTraceId = deriveTraceId(activeExecutionId);
+      lastRegisterTime = Date.now();
+      console.log(`[proxy] ⚡ SIGNAL REÇU - Exécution Verrouillée #${activeExecutionId} -> trace_id: ${activeTraceId}`);
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'registered', executionId: activeExecutionId, traceId: activeTraceId }));
+      return;
+    }
+  }
+
+  if (req.method === 'HEAD' || reqUrl === '/' || reqUrl === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ status: 'ok' }));
     return;
   }
 
-  if (req.url === '/last-usage') {
+  if (reqUrl === '/last-usage') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify(lastUsage));
     return;
   }
 
-  if (req.url.includes('/models')) {
+  if (reqUrl.includes('/models')) {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({
       object: "list",
@@ -93,10 +103,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  let traceId = await getParentExecutionTraceId();
-  if (!traceId) {
-    traceId = crypto.randomBytes(16).toString("hex");
-  }
+  // Résolution de l'exécution parent active
+  const syncInfo = await getParentExecutionTraceId();
+  let traceId = syncInfo ? syncInfo.traceId : crypto.randomBytes(16).toString("hex");
+  let execId = syncInfo ? syncInfo.execId : "unknown";
 
   if (!traceCallCounters.has(traceId)) {
     traceCallCounters.set(traceId, { chat: 0, embedding: 0, mcp: 0 });
@@ -104,28 +114,31 @@ const server = http.createServer(async (req, res) => {
   }
   const counters = traceCallCounters.get(traceId);
 
-  const isMcp = req.url.includes('/mcp-proxy');
-  const isEmbedding = req.url.includes('/embeddings');
+  const isMcp = reqUrl.includes('/mcp-proxy');
+  const isEmbedding = reqUrl.includes('/embeddings');
 
-  let derivedSpanId;
+  let parentSpanId;
   let targetPath;
 
   if (isMcp) {
-    targetPath = req.url;
-    derivedSpanId = deriveSpanId(traceId + `-mcp-${counters.mcp}`);
+    targetPath = reqUrl;
+    // Les requêtes MCP s'accrochent sous le nœud "MCP Client1"
+    parentSpanId = deriveSpanId(`${execId}_node_MCP Client1`);
     counters.mcp++;
   } else if (isEmbedding) {
     targetPath = '/ai-api/v1/embeddings';
-    derivedSpanId = deriveSpanId(traceId + `-embeddings-${counters.embedding}`);
+    // Les Embeddings s'accrochent sous "Pinecone Vector Store"
+    parentSpanId = deriveSpanId(`${execId}_node_Pinecone Vector Store`);
     counters.embedding++;
   } else {
     targetPath = '/ai-api/v1/chat/gemini';
-    derivedSpanId = deriveSpanId(traceId + `-chat-${counters.chat}`);
+    // Les requêtes LLM Gemini s'accrochent sous le nœud "AI Agent"
+    parentSpanId = deriveSpanId(`${execId}_node_AI Agent`);
     counters.chat++;
   }
 
-  const unifiedTraceparent = `00-${traceId}-${derivedSpanId}-01`;
-  const headers = {...req.headers};
+  const unifiedTraceparent = `00-${traceId}-${parentSpanId}-01`;
+  const headers = { ...req.headers };
   delete headers['authorization'];
   delete headers['Authorization'];
   delete headers['accept-encoding'];
@@ -136,8 +149,8 @@ const server = http.createServer(async (req, res) => {
   triggerTraceFromTraceparent(unifiedTraceparent);
 
   const requestStartTime = Date.now();
-
   let reqChunks = [];
+
   req.on('data', chunk => reqChunks.push(chunk));
   req.on('end', () => {
     let reqBody = Buffer.concat(reqChunks);
@@ -145,18 +158,16 @@ const server = http.createServer(async (req, res) => {
     if (!isMcp) {
       try {
         const reqJson = JSON.parse(reqBody.toString());
-
         if (isEmbedding) {
           delete reqJson.encoding_format;
           reqJson.encoding_format = 'float';
         }
 
-        const hasToolResult = reqJson.messages &&
-                              reqJson.messages.some(m => m.role === 'tool');
+        const hasToolResult = reqJson.messages && reqJson.messages.some(m => m.role === 'tool');
 
         if (hasToolResult) {
           const systemMsg = reqJson.messages.find(m => m.role === 'system');
-          const userMsg   = reqJson.messages.find(m => m.role === 'user');
+          const userMsg = reqJson.messages.find(m => m.role === 'user');
           const toolResults = reqJson.messages
             .filter(m => m.role === 'tool')
             .map(m => {
@@ -172,24 +183,10 @@ const server = http.createServer(async (req, res) => {
           });
           reqJson.messages = newMessages;
           delete reqJson.tools;
-
-        } else if (reqJson.messages) {
-          reqJson.messages = reqJson.messages.map(msg => {
-            if (msg.role === 'assistant' && msg.tool_calls) {
-              msg.tool_calls = msg.tool_calls.map(tc => {
-                if (tc.function?.arguments && Array.isArray(tc.function.arguments)) {
-                  tc.function.arguments = JSON.stringify(tc.function.arguments);
-                }
-                return tc;
-              });
-            }
-            return msg;
-          });
         }
 
         const correctedBody = JSON.stringify(reqJson);
         reqBody = Buffer.from(correctedBody);
-
       } catch(e) {}
     }
 
@@ -203,45 +200,35 @@ const server = http.createServer(async (req, res) => {
     };
 
     const proxy = https.request(options, (proxyRes) => {
-      const requestEndTime = Date.now();
-      const realLatencyMs = requestEndTime - requestStartTime;
-
+      const realLatencyMs = Date.now() - requestStartTime;
       let chunks = [];
+
       proxyRes.on('data', chunk => chunks.push(chunk));
       proxyRes.on('end', () => {
         const body = Buffer.concat(chunks);
-
         if (!isMcp) {
           try {
             const json = JSON.parse(body.toString());
-
             if (json.usage && !isEmbedding && json.choices?.[0]?.message?.content) {
-              const usagePayload = {
+              lastUsage = {
                 prompt_tokens: json.usage.prompt_tokens,
                 completion_tokens: json.usage.completion_tokens,
                 total_tokens: json.usage.total_tokens,
-                thinking_tokens: json.usage.total_tokens - json.usage.prompt_tokens - json.usage.completion_tokens,
                 latency_ms: realLatencyMs,
                 model: json.model
               };
-              lastUsage = usagePayload;
             }
-
-            if (json.data && isEmbedding) {
-              const emb = json.data[0]?.embedding;
-              if (Array.isArray(emb)) {
-                const buffer = Buffer.allocUnsafe(emb.length * 4);
-                emb.forEach((val, i) => buffer.writeFloatLE(val, i * 4));
-                json.data[0].embedding = buffer.toString('base64');
-                res.writeHead(proxyRes.statusCode, proxyRes.headers);
-                res.end(JSON.stringify(json));
-                return;
-              }
+            if (json.data && isEmbedding && Array.isArray(json.data[0]?.embedding)) {
+              const emb = json.data[0].embedding;
+              const buffer = Buffer.allocUnsafe(emb.length * 4);
+              emb.forEach((val, i) => buffer.writeFloatLE(val, i * 4));
+              json.data[0].embedding = buffer.toString('base64');
+              res.writeHead(proxyRes.statusCode, proxyRes.headers);
+              res.end(JSON.stringify(json));
+              return;
             }
-
           } catch(e) {}
         }
-
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
         res.end(body);
       });
