@@ -63,12 +63,11 @@ const server = http.createServer(async (req, res) => {
   const reqUrl = req.url || "/";
   console.log(`→ ${req.method} ${reqUrl}`);
 
-  // 1. EXTRACTION ET NETTOYAGE STRICT DE L'EXEC_ID (Extrait uniquement les chiffres)
+  // 1. EXTRACTION & NETTOYAGE STRICT DE L'EXEC_ID (Conservation uniquement des chiffres)
   const parsedUrl = new URL(reqUrl, `http://${req.headers.host || 'localhost'}`);
   let rawExecId = parsedUrl.searchParams.get('exec_id') || parsedUrl.searchParams.get('id');
 
   if (rawExecId) {
-    // Ne garder que la partie numérique de l'ID (élimine les /chat/completions ou {{...}} non évalués)
     const cleanIdMatch = rawExecId.match(/\d+/);
     if (cleanIdMatch) {
       activeExecutionId = cleanIdMatch[0];
@@ -131,7 +130,7 @@ const server = http.createServer(async (req, res) => {
   let targetPath;
 
   if (isMcp) {
-    targetPath = reqUrl.split('?')[0]; // Supprime les paramètres de requête pour Kong
+    targetPath = reqUrl.split('?')[0];
     parentSpanId = deriveSpanId(`${execId}_node_MCP Client1`);
     counters.mcp++;
   } else if (isEmbedding) {
@@ -213,7 +212,7 @@ const server = http.createServer(async (req, res) => {
       proxyRes.on('data', chunk => chunks.push(chunk));
       proxyRes.on('end', () => {
         const body = Buffer.concat(chunks);
-        
+
         if (!isMcp) {
           try {
             const json = JSON.parse(body.toString());
@@ -226,10 +225,23 @@ const server = http.createServer(async (req, res) => {
                 model: json.model
               };
             }
+
+            // 🔹 RECONVERSION EN BASE64 POUR N8N (Résout l'erreur des zéro `[0,0,0...]`)
+            if (json.data && isEmbedding && Array.isArray(json.data[0]?.embedding)) {
+              const emb = json.data[0].embedding;
+              const buffer = Buffer.allocUnsafe(emb.length * 4);
+              emb.forEach((val, i) => buffer.writeFloatLE(val, i * 4));
+              json.data[0].embedding = buffer.toString('base64');
+              
+              const modBody = Buffer.from(JSON.stringify(json));
+              const modHeaders = { ...proxyRes.headers, 'content-length': modBody.length };
+              res.writeHead(proxyRes.statusCode, modHeaders);
+              res.end(modBody);
+              return;
+            }
           } catch(e) {}
         }
 
-        // Transmettre la réponse brute à n8n (Intact Float Array pour Pinecone)
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
         res.end(body);
       });
