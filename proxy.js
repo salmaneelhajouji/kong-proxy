@@ -8,8 +8,6 @@ setupTracer();
 const traceCallCounters = new Map();
 let activeExecutionId = null;
 let activeTraceId = null;
-let lastRegisterTime = 0;
-const LOCK_TTL_MS = 5 * 60 * 1000;
 
 const MCP_SERVER_WORKFLOW_ID = "BMxUfKVV5C0rvQzo";
 
@@ -21,17 +19,12 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Secours API n8n (uniquement si le signal /register-execution n'a pas été reçu)
+// 🔹 Détection Dynamique et Garantie de l'Exécution Parent Active (#12535)
 async function getParentExecutionTraceId() {
-  const now = Date.now();
-  if (activeTraceId && (now - lastRegisterTime < LOCK_TTL_MS)) {
-    return { traceId: activeTraceId, execId: activeExecutionId };
-  }
-
   if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) return null;
 
   try {
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=15`;
     const resp = await fetch(url, {
       headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
     });
@@ -39,19 +32,33 @@ async function getParentExecutionTraceId() {
     if (resp.ok) {
       const body = await resp.json();
       const executions = body.data || [];
-      const parentExecutions = executions.filter(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID);
-      const activeRunning = parentExecutions.find(e => e.status === 'running');
-      const latestExec = activeRunning || parentExecutions.sort((a, b) => Number(b.id) - Number(a.id))[0];
 
-      if (latestExec) {
-        activeExecutionId = String(latestExec.id);
+      // Exclure le sous-workflow MCP Server pour ne garder que le workflow parent
+      const parentExecs = executions.filter(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID);
+
+      // 1. Priorité Absolue : Exécution Parent actuellement EN COURS ("running")
+      const runningExecs = parentExecs.filter(e => e.status === 'running');
+      if (runningExecs.length > 0) {
+        runningExecs.sort((a, b) => Number(b.id) - Number(a.id));
+        const active = runningExecs[0];
+        activeExecutionId = String(active.id);
         activeTraceId = deriveTraceId(activeExecutionId);
-        lastRegisterTime = now;
+        console.log(`[proxy] 🟢 DÉTECTION DIRECTE -> Parent En Cours #${activeExecutionId} (status: running)`);
+        return { traceId: activeTraceId, execId: activeExecutionId };
+      }
+
+      // 2. Secours : Prendre l'ID numérique le plus élevé absolu
+      parentExecs.sort((a, b) => Number(b.id) - Number(a.id));
+      if (parentExecs.length > 0) {
+        const latest = parentExecs[0];
+        activeExecutionId = String(latest.id);
+        activeTraceId = deriveTraceId(activeExecutionId);
+        console.log(`[proxy] 🟢 DÉTECTION SECONDAIRE -> Dernier Parent #${activeExecutionId} (status: ${latest.status})`);
         return { traceId: activeTraceId, execId: activeExecutionId };
       }
     }
   } catch (e) {
-    console.error("[proxy] Erreur fetch executions n8n:", e.message);
+    console.error("[proxy] Erreur API n8n:", e.message);
   }
 
   return null;
@@ -63,22 +70,24 @@ const server = http.createServer(async (req, res) => {
   const reqUrl = req.url || "/";
   console.log(`→ ${req.method} ${reqUrl}`);
 
-  // 1. ⚡ RÉCEPTION DU SIGNAL DU NŒUD "Code in JavaScript"
+  // 1. SIGNAL DIRECT (si envoyé par le nœud Code in JavaScript)
   if (reqUrl.includes('/register-execution')) {
     const parsedUrl = new URL(reqUrl, `http://${req.headers.host || 'localhost'}`);
     const execId = parsedUrl.searchParams.get('id');
 
     if (execId) {
-      activeExecutionId = String(execId);
-      activeTraceId = deriveTraceId(activeExecutionId);
-      lastRegisterTime = Date.now();
-      traceCallCounters.delete(activeTraceId);
+      const cleanIdMatch = execId.match(/\d+/);
+      if (cleanIdMatch) {
+        activeExecutionId = cleanIdMatch[0];
+        activeTraceId = deriveTraceId(activeExecutionId);
+        traceCallCounters.delete(activeTraceId);
 
-      console.log(`[proxy] ⚡ SIGNAL REÇU DU NŒUD JS - Exécution Verrouillée #${activeExecutionId} -> trace_id: ${activeTraceId}`);
+        console.log(`[proxy] ⚡ SIGNAL REÇU DU NŒUD JS -> Exécution #${activeExecutionId} | trace_id: ${activeTraceId}`);
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'registered', executionId: activeExecutionId, traceId: activeTraceId }));
-      return;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'registered', executionId: activeExecutionId, traceId: activeTraceId }));
+        return;
+      }
     }
   }
 
@@ -106,15 +115,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 2. RÉSOLUTION DU TRACE_ID
-  let traceId = activeTraceId;
-  let execId = activeExecutionId;
-
-  if (!traceId) {
-    const syncInfo = await getParentExecutionTraceId();
-    traceId = syncInfo ? syncInfo.traceId : crypto.randomBytes(16).toString("hex");
-    execId = syncInfo ? syncInfo.execId : "unknown";
-  }
+  // 2. RÉSOLUTION DYNAMIQUE DE L'EXÉCUTION ACTIVE
+  const syncInfo = await getParentExecutionTraceId();
+  let traceId = syncInfo ? syncInfo.traceId : crypto.randomBytes(16).toString("hex");
+  let execId = syncInfo ? syncInfo.execId : "unknown";
 
   if (!traceCallCounters.has(traceId)) {
     traceCallCounters.set(traceId, { chat: 0, embedding: 0, mcp: 0 });
