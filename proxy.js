@@ -6,6 +6,13 @@ setupTracer();
 
 const traceCallCounters = new Map();
 
+let activeAgentTraceId = null;
+let lastAgentActivityTime = 0;
+const AGENT_LOCK_TTL_MS = 2 * 60 * 1000;
+
+const workflowNameCache = new Map();
+let lastWfCacheTime = 0;
+
 function deriveTraceId(seed) {
   return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
 }
@@ -14,37 +21,70 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Résolution stricte : Récupère uniquement le workflow parent Agent Discovery
-async function fetchParentAgentDiscoveryTraceId() {
-  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) return null;
+// 🔹 Rafraîchissement du cache des workflows n8n
+async function refreshWorkflowCache() {
+  const now = Date.now();
+  if (workflowNameCache.size > 0 && (now - lastWfCacheTime < 60000)) return;
+  try {
+    const resp = await fetch(`${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/workflows`, {
+      headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
+    });
+    if (resp.ok) {
+      const body = await resp.json();
+      (body.data || []).forEach(w => workflowNameCache.set(w.id, w.name));
+      lastWfCacheTime = now;
+    }
+  } catch (e) {
+    console.error("[proxy] Erreur rafraîchissement workflows:", e.message);
+  }
+}
+
+// 🔹 Récupération immédiate de la TOUTE DERNIÈRE exécution parent (même statut 'running')
+async function getOrFetchParentTraceId() {
+  const now = Date.now();
+  
+  if (activeAgentTraceId && (now - lastAgentActivityTime < AGENT_LOCK_TTL_MS)) {
+    lastAgentActivityTime = now;
+    return activeAgentTraceId;
+  }
+
+  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) {
+    return crypto.randomBytes(16).toString("hex");
+  }
 
   try {
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10&includeData=true`;
+    await refreshWorkflowCache();
+
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
     const resp = await fetch(url, {
       headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
     });
-
     if (resp.ok) {
       const body = await resp.json();
       const executions = body.data || [];
-
-      // 🎯 Filtrer pour isoler l'exécution parent "Agent Discovery" (qui possède le nœud Webhook/Code)
+      
+      // 🎯 Sélectionner la toute plus récente exécution (statut running inclus) qui N'EST PAS un MCP Server
       const parentExec = executions.find(e => {
-        const runData = e.data?.resultData?.runData || {};
-        return runData['Webhook'] || runData['Code in JavaScript'] || runData['AI Agent'];
-      }) || executions.find(e => !(e.workflowData?.name || "").toLowerCase().includes("mcp server"));
+        const wfName = (workflowNameCache.get(e.workflowId) || "").toLowerCase();
+        return (wfName.includes("agent") || e.mode === "webhook" || e.mode === "manual") && !wfName.includes("mcp server");
+      }) || executions.find(e => {
+        const wfName = (workflowNameCache.get(e.workflowId) || "").toLowerCase();
+        return !wfName.includes("mcp server");
+      }) || executions[0];
 
       if (parentExec) {
-        const traceId = deriveTraceId(parentExec.id);
-        console.log(`[proxy] 🟢 Parent Agent Discovery identifié (#${parentExec.id}) -> trace_id: ${traceId}`);
-        return traceId;
+        const wfName = workflowNameCache.get(parentExec.workflowId) || "Agent Discovery";
+        activeAgentTraceId = deriveTraceId(parentExec.id);
+        lastAgentActivityTime = now;
+        console.log(`[proxy] 🟢 Sync direct avec l'exécution RÉELLE #${parentExec.id} (${wfName}) -> trace_id: ${activeAgentTraceId}`);
+        return activeAgentTraceId;
       }
     }
   } catch (e) {
-    console.error("[proxy] Erreur fetchParentAgentDiscoveryTraceId:", e.message);
+    console.error("[proxy] Erreur de récupération execution n8n:", e.message);
   }
 
-  return null;
+  return crypto.randomBytes(16).toString("hex");
 }
 
 let lastUsage = {};
@@ -76,10 +116,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  let traceId = await fetchParentAgentDiscoveryTraceId();
-  if (!traceId) {
-    traceId = crypto.randomBytes(16).toString("hex");
-  }
+  const traceId = await getOrFetchParentTraceId();
 
   if (!traceCallCounters.has(traceId)) {
     traceCallCounters.set(traceId, { chat: 0, embedding: 0, mcp: 0 });
@@ -116,7 +153,6 @@ const server = http.createServer(async (req, res) => {
   headers['traceparent'] = unifiedTraceparent;
   console.log(`→ Header transmis à Kong: ${unifiedTraceparent}`);
 
-  // 🚀 Déclenchement de l'export d'arbre complet via otel-hook-v4.js
   triggerTraceFromTraceparent(unifiedTraceparent);
 
   const requestStartTime = Date.now();
