@@ -22,6 +22,7 @@ function deriveSpanId(seed) {
 }
 
 // 🔹 Récupération dynamique de secours via l'API n8n (si le signal n'est pas encore arrivé)
+// 🔹 Récupération dynamique fiable de l'Exécution Parent n8n
 async function getParentExecutionTraceId() {
   const now = Date.now();
   if (activeTraceId && (now - lastRegisterTime < LOCK_TTL_MS)) {
@@ -31,7 +32,8 @@ async function getParentExecutionTraceId() {
   if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) return null;
 
   try {
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=5`;
+    // 1. Chercher prioritairement les exécutions actives ("running")
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
     const resp = await fetch(url, {
       headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
     });
@@ -39,13 +41,19 @@ async function getParentExecutionTraceId() {
     if (resp.ok) {
       const body = await resp.json();
       const executions = body.data || [];
-      const parentExec = executions.find(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID) || executions[0];
 
-      if (parentExec) {
-        activeExecutionId = String(parentExec.id);
+      // Filtrer les exécutions du workflow MCP Server
+      const parentExecutions = executions.filter(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID);
+
+      // Sélectionner en priorité une exécution "running", sinon la plus récente par ID (tri numérique décroissant)
+      const activeRunning = parentExecutions.find(e => e.status === 'running');
+      const latestExec = activeRunning || parentExecutions.sort((a, b) => Number(b.id) - Number(a.id))[0];
+
+      if (latestExec) {
+        activeExecutionId = String(latestExec.id);
         activeTraceId = deriveTraceId(activeExecutionId);
         lastRegisterTime = now;
-        console.log(`[proxy] 🟢 Sync API n8n -> Exécution Parent #${activeExecutionId} | trace_id: ${activeTraceId}`);
+        console.log(`[proxy] 🟢 Sync API n8n -> Exécution Parent #${activeExecutionId} (Status: ${latestExec.status || 'finished'}) | trace_id: ${activeTraceId}`);
         return { traceId: activeTraceId, execId: activeExecutionId };
       }
     }
@@ -55,7 +63,6 @@ async function getParentExecutionTraceId() {
 
   return null;
 }
-
 let lastUsage = {};
 
 const server = http.createServer(async (req, res) => {
