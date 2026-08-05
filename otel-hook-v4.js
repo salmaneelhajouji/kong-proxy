@@ -1,3 +1,4 @@
+// otel-hook-v4.js
 const crypto = require("crypto");
 const { trace, context } = require("@opentelemetry/api");
 const { BasicTracerProvider, SimpleSpanProcessor } = require("@opentelemetry/sdk-trace-node");
@@ -71,7 +72,7 @@ function setupTracer() {
   provider.register();
 
   tracer = trace.getTracer("n8n-webhook-hook");
-  console.log(`[otel] Tracer initialisé (Arbre Hiérarchique n8n Unifié) -> ${OTEL_ENDPOINT}`);
+  console.log(`[otel] Tracer initialisé (Arbre Hiérarchique Parfait) -> ${OTEL_ENDPOINT}`);
 }
 
 function deriveTraceId(seed) {
@@ -122,9 +123,7 @@ async function resolveExecutionIdFromTraceId(traceId) {
       const body = await resp.json();
       const executions = body.data || [];
       const parentExec = executions.find(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID) || executions[0];
-      if (parentExec) {
-        return parseInt(parentExec.id, 10);
-      }
+      if (parentExec) return parseInt(parentExec.id, 10);
     }
   } catch (e) {}
 
@@ -139,9 +138,7 @@ async function n8nGet(path) {
       "Accept": "application/json",
     },
   });
-  if (!resp.ok) {
-    throw new Error(`n8n API error ${resp.status}: ${await resp.text()}`);
-  }
+  if (!resp.ok) throw new Error(`n8n API error ${resp.status}: ${await resp.text()}`);
   return resp.json();
 }
 
@@ -218,7 +215,7 @@ function parseExecution(detail) {
     nodeRuns.forEach((nodeRun, runIndex) => {
       const { inputData, outputData } = extractIO(nodeRun);
       nodes.push({
-        nodeName,
+        nodeName: nodeName.trim(),
         nodeType: nodeTypeLookup[nodeName],
         startTimeMs: nodeRun.startTime,
         durationMs: nodeRun.executionTime,
@@ -248,6 +245,17 @@ async function waitForExecutionToFinish(executionId, maxAttempts = 40) {
   return null;
 }
 
+// 🔹 DÉFINITION DE LA HIÉRARCHIE STRICTE
+function getNodeRank(nodeName) {
+  const name = (nodeName || "").trim();
+  if (name === "AI Agent") return 1;                   // NIVEAU 1 : Reçoit tout
+  if (name === "LLM" || name === "MCP Client1") return 2; // NIVEAU 2 : Sous AI Agent
+  if (name === "MCP Server Trigger") return 3;         // NIVEAU 3 : Sous MCP Client1
+  if (name === "Pinecone Vector Store") return 4;      // NIVEAU 4 : Sous MCP Server Trigger
+  if (name === "Embeddings OpenAI") return 5;          // NIVEAU 5 : Sous Pinecone
+  return 0;                                            // NIVEAU 0 : Webhook, Code, Loop, Wait...
+}
+
 async function buildAndExportUnifiedSpans(allParsed, traceId) {
   const mainParsed = allParsed[0];
   const { parent: mainParent } = mainParsed;
@@ -257,7 +265,13 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     allNodes.push(...parsed.nodes);
   });
 
-  allNodes.sort((a, b) => (a.startTimeMs || 0) - (b.startTimeMs || 0));
+  // 🚀 TRI PAR RANG HIÉRARCHIQUE : AI Agent est TOUJOURS créé en premier
+  allNodes.sort((a, b) => {
+    const rankA = getNodeRank(a.nodeName);
+    const rankB = getNodeRank(b.nodeName);
+    if (rankA !== rankB) return rankA - rankB;
+    return (a.startTimeMs || 0) - (b.startTimeMs || 0);
+  });
 
   const startMs = Date.parse(mainParent.startedAt);
   let maxEndMs = Date.parse(mainParent.stoppedAt);
@@ -267,7 +281,6 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     if (end > maxEndMs) maxEndMs = end;
   });
 
-  // 1. SPAN RACINE UNIFIÉE (Workflow Parent)
   forcedTraceId = traceId;
   forcedNextSpanId = deriveSpanId(`${mainParent.executionId}_root`);
   
@@ -286,11 +299,8 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
   const rootCtx = trace.setSpan(context.active(), rootSpan);
   const spanContextMap = new Map();
 
-  // Enregistrer le context root
-  spanContextMap.set("root", rootSpan.spanContext());
-
-  // 2. CONTEXTES ET HIÉRARCHIE PENSÉS POUR N8N + LANGFUSE
   allNodes.forEach(node => {
+    const nodeName = node.nodeName;
     const durationMs = Math.max(node.durationMs || 1, 1);
     let nodeStartMs = node.startTimeMs || startMs;
     let nodeEndMs = nodeStartMs + durationMs;
@@ -298,41 +308,49 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     if (nodeStartMs < startMs) nodeStartMs = startMs;
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
-    const nodeKey = `${node.workflowName}_${node.nodeName}`;
+    forcedNextSpanId = deriveSpanId(`${node.executionId}_node_${nodeName}`);
 
-    // Attribution de l'ID Déterministe pour CE NŒUD EXACT
-    forcedNextSpanId = deriveSpanId(`${node.executionId}_node_${node.nodeName}`);
-
-    // Choix du parent hiérarchique OpenTelemetry
+    // 🎯 ASSIGNATION STRICTE DES PARENTS DANS L'ARBRE
     let parentCtxToUse = rootCtx;
 
-    if (node.nodeName === "MCP Client1") {
-      const aiAgentCtx = spanContextMap.get(`${mainParent.workflowName}_AI Agent`);
-      if (aiAgentCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(aiAgentCtx));
-    } else if (node.nodeName === "MCP Server Trigger") {
-      const mcpClientCtx = spanContextMap.get(`${mainParent.workflowName}_MCP Client1`);
+    if (nodeName === "LLM" || nodeName === "MCP Client1") {
+      const agentCtx = spanContextMap.get("AI Agent");
+      if (agentCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(agentCtx));
+    } else if (nodeName === "MCP Server Trigger") {
+      const mcpClientCtx = spanContextMap.get("MCP Client1");
       if (mcpClientCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(mcpClientCtx));
-    } else if (node.nodeName === "Pinecone Vector Store") {
-      const mcpTriggerCtx = spanContextMap.get(`MCP Server_MCP Server Trigger`);
-      if (mcpTriggerCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(mcpTriggerCtx));
-    } else if (node.nodeName === "Embeddings OpenAI") {
-      const vectorCtx = spanContextMap.get(`MCP Server_Pinecone Vector Store`);
+      else {
+        const agentCtx = spanContextMap.get("AI Agent");
+        if (agentCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(agentCtx));
+      }
+    } else if (nodeName === "Pinecone Vector Store") {
+      const triggerCtx = spanContextMap.get("MCP Server Trigger");
+      if (triggerCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(triggerCtx));
+      else {
+        const mcpClientCtx = spanContextMap.get("MCP Client1");
+        if (mcpClientCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(mcpClientCtx));
+      }
+    } else if (nodeName === "Embeddings OpenAI") {
+      const vectorCtx = spanContextMap.get("Pinecone Vector Store");
       if (vectorCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(vectorCtx));
+      else {
+        const triggerCtx = spanContextMap.get("MCP Server Trigger");
+        if (triggerCtx) parentCtxToUse = trace.setSpan(context.active(), trace.wrapSpanContext(triggerCtx));
+      }
     }
 
     const childSpan = tracer.startSpan(
-      node.nodeName,
+      nodeName,
       { startTime: nodeStartMs },
       parentCtxToUse
     );
 
-    // Métadonnées Langfuse / OpenInference
-    if (node.nodeName.toLowerCase().includes("llm") || node.nodeName.toLowerCase().includes("chat")) {
+    if (nodeName === "LLM") {
       childSpan.setAttribute("openinference.type", "LLM");
       childSpan.setAttribute("gen_ai.system", "google");
-    } else if (node.nodeName.toLowerCase().includes("vector") || node.nodeName.toLowerCase().includes("embedding")) {
+    } else if (nodeName === "Pinecone Vector Store" || nodeName === "Embeddings OpenAI") {
       childSpan.setAttribute("openinference.type", "RETRIEVER");
-    } else if (node.nodeName.toLowerCase().includes("agent")) {
+    } else if (nodeName === "AI Agent") {
       childSpan.setAttribute("openinference.type", "AGENT");
     } else {
       childSpan.setAttribute("openinference.type", "CHAIN");
@@ -340,7 +358,7 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
 
     childSpan.setAttribute("n8n.execution.id", node.executionId);
     childSpan.setAttribute("n8n.workflow.name", node.workflowName);
-    childSpan.setAttribute("n8n.node.name", node.nodeName);
+    childSpan.setAttribute("n8n.node.name", nodeName);
     childSpan.setAttribute("n8n.node.type", node.nodeType || "unknown");
     childSpan.setAttribute("n8n.node.duration_ms", durationMs);
 
@@ -348,7 +366,7 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     if (node.outputData) childSpan.setAttribute("output.value", truncate(node.outputData));
 
     childSpan.setStatus({ code: toOtelStatusCode(node.status) });
-    spanContextMap.set(nodeKey, childSpan.spanContext());
+    spanContextMap.set(nodeName, childSpan.spanContext());
 
     childSpan.end(nodeEndMs);
   });
@@ -356,7 +374,7 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
   rootSpan.end(maxEndMs);
 
   if (provider) await provider.forceFlush();
-  console.log(`[otel] 🚀 Succès : Tous les 9 nœuds n8n ont été exportés sous [Exécution #${mainParent.executionId}] | trace_id=${traceId}`);
+  console.log(`[otel] 🚀 Succès : Arbre hiérarchique parfait exporté sous [Exécution #${mainParent.executionId}] | trace_id=${traceId}`);
 }
 
 async function processTraceparentAsync(traceparentHeader) {
@@ -390,7 +408,6 @@ async function processTraceparentAsync(traceparentHeader) {
     const parentEndMs = Date.parse(parentDetail.stoppedAt);
     const allParsed = [parseExecution(parentDetail)];
 
-    // Récupération automatique du sous-workflow MCP (#12522)
     for (let offset = 1; offset <= 3; offset++) {
       const childId = parentExecutionId + offset;
       try {
