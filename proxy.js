@@ -8,7 +8,10 @@ const traceCallCounters = new Map();
 
 let lockedAgentTraceId = null;
 let lastLockTime = 0;
-const AGENT_LOCK_TTL_MS = 3 * 60 * 1000;
+const AGENT_LOCK_TTL_MS = 3 * 60 * 1000; // 3 minutes
+
+// ID unique du workflow MCP Server (obtenu depuis les logs n8n)
+const MCP_SERVER_WORKFLOW_ID = "BMxUfKVV5C0rvQzo";
 
 function deriveTraceId(seed) {
   return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
@@ -18,24 +21,53 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
+// 🔹 Récupération propre et garantie du parent "Agent Discovery"
+async function getParentExecutionTraceId() {
+  const now = Date.now();
+  
+  if (lockedAgentTraceId && (now - lastLockTime < AGENT_LOCK_TTL_MS)) {
+    lastLockTime = now;
+    return lockedAgentTraceId;
+  }
+
+  if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) {
+    return null;
+  }
+
+  try {
+    // Appel propre sans query param invalide
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
+    const resp = await fetch(url, {
+      headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
+    });
+
+    if (resp.ok) {
+      const body = await resp.json();
+      const executions = body.data || [];
+
+      // Sélectionner l'exécution la plus récente du workflow principal (exclure MCP Server)
+      const parentExec = executions.find(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID) || executions[0];
+
+      if (parentExec) {
+        lockedAgentTraceId = deriveTraceId(parentExec.id);
+        lastLockTime = now;
+        console.log(`[proxy] 🟢 Sync direct avec Exécution Parent #${parentExec.id} -> trace_id: ${lockedAgentTraceId}`);
+        return lockedAgentTraceId;
+      }
+    } else {
+      console.error(`[proxy] API n8n HTTP ${resp.status}`);
+    }
+  } catch (e) {
+    console.error("[proxy] Erreur fetch executions n8n:", e.message);
+  }
+
+  return null;
+}
+
 let lastUsage = {};
 
 const server = http.createServer(async (req, res) => {
   console.log(`→ ${req.method} ${req.url}`);
-
-  // 🎯 Endpoint d'enregistrement immédiat de l'exécution active depuis n8n
-  if (req.url.startsWith('/register-execution')) {
-    const urlObj = new URL(req.url, `http://${req.headers.host}`);
-    const execId = urlObj.searchParams.get('id');
-    if (execId) {
-      lockedAgentTraceId = deriveTraceId(execId);
-      lastLockTime = Date.now();
-      console.log(`[proxy] ⚡ Signal reçu de n8n! Verrouillage direct sur Exécution #${execId} -> trace_id: ${lockedAgentTraceId}`);
-    }
-    res.writeHead(200, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify({ status: 'registered' }));
-    return;
-  }
 
   if (req.method === 'HEAD' || req.url === '/' || req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
@@ -61,13 +93,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const now = Date.now();
-  let traceId = null;
-
-  if (lockedAgentTraceId && (now - lastLockTime < AGENT_LOCK_TTL_MS)) {
-    traceId = lockedAgentTraceId;
-    lastLockTime = now;
-  } else {
+  let traceId = await getParentExecutionTraceId();
+  if (!traceId) {
     traceId = crypto.randomBytes(16).toString("hex");
   }
 
