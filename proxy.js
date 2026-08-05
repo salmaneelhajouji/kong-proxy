@@ -21,7 +21,7 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// Récupération dynamique de secours via l'API n8n si aucun /register-execution n'a été reçu
+// 🔹 Récupération dynamique de secours via l'API n8n (si le signal n'est pas encore arrivé)
 async function getParentExecutionTraceId() {
   const now = Date.now();
   if (activeTraceId && (now - lastRegisterTime < LOCK_TTL_MS)) {
@@ -62,7 +62,7 @@ const server = http.createServer(async (req, res) => {
   const reqUrl = req.url || "/";
   console.log(`→ ${req.method} ${reqUrl}`);
 
-  // 1. Enregistrement instantané de l'execution_id parent dès la milliseconde 0
+  // 1. ⚡ ENREGISTREMENT INSTANTANÉ & RÉINITIALISATION DU CACHE DE TRACE
   if (reqUrl.includes('/register-execution')) {
     const urlParams = new URLSearchParams(reqUrl.split('?')[1] || '');
     const execId = urlParams.get('id');
@@ -71,6 +71,10 @@ const server = http.createServer(async (req, res) => {
       activeExecutionId = String(execId);
       activeTraceId = deriveTraceId(activeExecutionId);
       lastRegisterTime = Date.now();
+
+      // Suppression de tout état résiduel sur ce trace_id
+      traceCallCounters.delete(activeTraceId);
+
       console.log(`[proxy] ⚡ SIGNAL REÇU - Exécution Verrouillée #${activeExecutionId} -> trace_id: ${activeTraceId}`);
       
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -103,7 +107,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Résolution de l'exécution parent active
+  // 2. 🔀 PROXYING ET INJECTION W3C TRACEPARENT
   const syncInfo = await getParentExecutionTraceId();
   let traceId = syncInfo ? syncInfo.traceId : crypto.randomBytes(16).toString("hex");
   let execId = syncInfo ? syncInfo.execId : "unknown";
@@ -122,17 +126,14 @@ const server = http.createServer(async (req, res) => {
 
   if (isMcp) {
     targetPath = reqUrl;
-    // Les requêtes MCP s'accrochent sous le nœud "MCP Client1"
     parentSpanId = deriveSpanId(`${execId}_node_MCP Client1`);
     counters.mcp++;
   } else if (isEmbedding) {
     targetPath = '/ai-api/v1/embeddings';
-    // Les Embeddings s'accrochent sous "Pinecone Vector Store"
     parentSpanId = deriveSpanId(`${execId}_node_Pinecone Vector Store`);
     counters.embedding++;
   } else {
     targetPath = '/ai-api/v1/chat/gemini';
-    // Les requêtes LLM Gemini s'accrochent sous le nœud "AI Agent"
     parentSpanId = deriveSpanId(`${execId}_node_AI Agent`);
     counters.chat++;
   }
