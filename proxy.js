@@ -1,12 +1,10 @@
 const https = require("https");
 const http = require("http");
 const crypto = require("crypto");
+const { setupTracer, triggerTraceFromTraceparent } = require("./otel-hook-v4.js");
+setupTracer();
 
 const traceCallCounters = new Map();
-
-let lockedAgentTraceId = null;
-let lastLockTime = 0;
-const LOCK_TTL_MS = 2 * 60 * 1000; // Verrouille la trace pendant 2 minutes
 
 function deriveTraceId(seed) {
   return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
@@ -16,19 +14,12 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Récupération du Trace ID natif directement depuis l'exécution n8n
-async function fetchNativeN8nTraceId() {
-  const now = Date.now();
-
-  if (lockedAgentTraceId && (now - lastLockTime < LOCK_TTL_MS)) {
-    lastLockTime = now;
-    return lockedAgentTraceId;
-  }
-
+// 🔹 Résolution stricte : Récupère uniquement le workflow parent Agent Discovery
+async function fetchParentAgentDiscoveryTraceId() {
   if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) return null;
 
   try {
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=5&includeData=true`;
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10&includeData=true`;
     const resp = await fetch(url, {
       headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
     });
@@ -37,27 +28,20 @@ async function fetchNativeN8nTraceId() {
       const body = await resp.json();
       const executions = body.data || [];
 
-      // Trouver l'exécution racine Agent Discovery
-      const agentExec = executions.find(e => {
-        const wId = e.workflowId;
-        return e.data?.resultData?.runData?.['Code in JavaScript'];
-      }) || executions[0];
+      // 🎯 Filtrer pour isoler l'exécution parent "Agent Discovery" (qui possède le nœud Webhook/Code)
+      const parentExec = executions.find(e => {
+        const runData = e.data?.resultData?.runData || {};
+        return runData['Webhook'] || runData['Code in JavaScript'] || runData['AI Agent'];
+      }) || executions.find(e => !(e.workflowData?.name || "").toLowerCase().includes("mcp server"));
 
-      if (agentExec) {
-        // Extraction du otel_trace_id généré par Code in JavaScript
-        const jsNodeRun = agentExec.data?.resultData?.runData?.['Code in JavaScript']?.[0];
-        const extractedTraceId = jsNodeRun?.data?.main?.[0]?.[0]?.json?.otel_trace_id;
-
-        const finalTraceId = extractedTraceId || deriveTraceId(agentExec.id);
-        lockedAgentTraceId = finalTraceId;
-        lastLockTime = now;
-
-        console.log(`[proxy] 🟢 Sync parfait avec Trace ID n8n (#${agentExec.id}) -> ${finalTraceId}`);
-        return finalTraceId;
+      if (parentExec) {
+        const traceId = deriveTraceId(parentExec.id);
+        console.log(`[proxy] 🟢 Parent Agent Discovery identifié (#${parentExec.id}) -> trace_id: ${traceId}`);
+        return traceId;
       }
     }
   } catch (e) {
-    console.error("[proxy] Erreur sync n8n API:", e.message);
+    console.error("[proxy] Erreur fetchParentAgentDiscoveryTraceId:", e.message);
   }
 
   return null;
@@ -92,7 +76,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  let traceId = await fetchNativeN8nTraceId();
+  let traceId = await fetchParentAgentDiscoveryTraceId();
   if (!traceId) {
     traceId = crypto.randomBytes(16).toString("hex");
   }
@@ -131,6 +115,9 @@ const server = http.createServer(async (req, res) => {
 
   headers['traceparent'] = unifiedTraceparent;
   console.log(`→ Header transmis à Kong: ${unifiedTraceparent}`);
+
+  // 🚀 Déclenchement de l'export d'arbre complet via otel-hook-v4.js
+  triggerTraceFromTraceparent(unifiedTraceparent);
 
   const requestStartTime = Date.now();
 
