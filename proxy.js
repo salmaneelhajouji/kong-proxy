@@ -8,6 +8,8 @@ setupTracer();
 const traceCallCounters = new Map();
 let activeExecutionId = null;
 let activeTraceId = null;
+let lastRegisterTime = 0;
+const LOCK_TTL_MS = 2 * 60 * 1000; // Verrou de 2 minutes par exécution
 
 const MCP_SERVER_WORKFLOW_ID = "BMxUfKVV5C0rvQzo";
 
@@ -19,12 +21,19 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Détection Dynamique et Garantie de l'Exécution Parent Active (#12535)
+// 🔹 Détection et Prédiction Intelligente de l'Exécution Parent Active
 async function getParentExecutionTraceId() {
+  const now = Date.now();
+  
+  // 1. Si une exécution a été verrouillée il y a moins de 2 minutes, conserver son trace_id
+  if (activeTraceId && (now - lastRegisterTime < LOCK_TTL_MS)) {
+    return { traceId: activeTraceId, execId: activeExecutionId };
+  }
+
   if (!process.env.N8N_HOST || !process.env.N8N_API_KEY) return null;
 
   try {
-    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=15`;
+    const url = `${process.env.N8N_HOST.replace(/\/$/, "")}/api/v1/executions?limit=10`;
     const resp = await fetch(url, {
       headers: { "X-N8N-API-KEY": process.env.N8N_API_KEY, "Accept": "application/json" }
     });
@@ -32,28 +41,48 @@ async function getParentExecutionTraceId() {
     if (resp.ok) {
       const body = await resp.json();
       const executions = body.data || [];
+      if (executions.length === 0) return null;
 
-      // Exclure le sous-workflow MCP Server pour ne garder que le workflow parent
-      const parentExecs = executions.filter(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID);
-
-      // 1. Priorité Absolue : Exécution Parent actuellement EN COURS ("running")
-      const runningExecs = parentExecs.filter(e => e.status === 'running');
-      if (runningExecs.length > 0) {
-        runningExecs.sort((a, b) => Number(b.id) - Number(a.id));
-        const active = runningExecs[0];
-        activeExecutionId = String(active.id);
+      // A. Vérifier si n8n signale déjà une exécution "running"
+      const runningParent = executions.find(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID && (e.status === 'running' || !e.stoppedAt));
+      if (runningParent) {
+        activeExecutionId = String(runningParent.id);
         activeTraceId = deriveTraceId(activeExecutionId);
-        console.log(`[proxy] 🟢 DÉTECTION DIRECTE -> Parent En Cours #${activeExecutionId} (status: running)`);
+        lastRegisterTime = now;
+        console.log(`[proxy] 🟢 EXÉCUTION EN COURS DÉTECTÉE -> #${activeExecutionId}`);
         return { traceId: activeTraceId, execId: activeExecutionId };
       }
 
-      // 2. Secours : Prendre l'ID numérique le plus élevé absolu
-      parentExecs.sort((a, b) => Number(b.id) - Number(a.id));
-      if (parentExecs.length > 0) {
-        const latest = parentExecs[0];
-        activeExecutionId = String(latest.id);
+      // B. Trouver l'ID le plus élevé absolu dans la base de données (Parent ou Sub-workflow)
+      const sortedAll = [...executions].sort((a, b) => Number(b.id) - Number(a.id));
+      const maxExec = sortedAll[0];
+      const maxId = Number(maxExec.id);
+      const stoppedTime = maxExec.stoppedAt ? Date.parse(maxExec.stoppedAt) : now;
+
+      // C. Prédiction Mathématique : Si la dernière exécution est terminée depuis > 3 secondes,
+      // la requête entrante appartient à la NOUVELLE exécution qui démarre !
+      if (now - stoppedTime > 3000) {
+        let predictedParentId;
+        if (maxExec.workflowId === MCP_SERVER_WORKFLOW_ID) {
+          predictedParentId = maxId + 1; // Ex: #12536 (Sub) -> #12537 (Parent)
+        } else {
+          predictedParentId = maxId + 2; // Ex: #12535 (Parent) -> #12537 (Parent)
+        }
+
+        activeExecutionId = String(predictedParentId);
         activeTraceId = deriveTraceId(activeExecutionId);
-        console.log(`[proxy] 🟢 DÉTECTION SECONDAIRE -> Dernier Parent #${activeExecutionId} (status: ${latest.status})`);
+        lastRegisterTime = now;
+        console.log(`[proxy] ⚡ PRÉDICTION NOUVELLE EXÉCUTION -> Parent #${activeExecutionId} (Dernière connue en BDD: #${maxId})`);
+        return { traceId: activeTraceId, execId: activeExecutionId };
+      }
+
+      // D. Fallback si terminée à l'instant
+      const parentExecs = executions.filter(e => e.workflowId !== MCP_SERVER_WORKFLOW_ID).sort((a, b) => Number(b.id) - Number(a.id));
+      if (parentExecs.length > 0) {
+        activeExecutionId = String(parentExecs[0].id);
+        activeTraceId = deriveTraceId(activeExecutionId);
+        lastRegisterTime = now;
+        console.log(`[proxy] 🟢 DERNIER PARENT -> #${activeExecutionId}`);
         return { traceId: activeTraceId, execId: activeExecutionId };
       }
     }
@@ -69,27 +98,6 @@ let lastUsage = {};
 const server = http.createServer(async (req, res) => {
   const reqUrl = req.url || "/";
   console.log(`→ ${req.method} ${reqUrl}`);
-
-  // 1. SIGNAL DIRECT (si envoyé par le nœud Code in JavaScript)
-  if (reqUrl.includes('/register-execution')) {
-    const parsedUrl = new URL(reqUrl, `http://${req.headers.host || 'localhost'}`);
-    const execId = parsedUrl.searchParams.get('id');
-
-    if (execId) {
-      const cleanIdMatch = execId.match(/\d+/);
-      if (cleanIdMatch) {
-        activeExecutionId = cleanIdMatch[0];
-        activeTraceId = deriveTraceId(activeExecutionId);
-        traceCallCounters.delete(activeTraceId);
-
-        console.log(`[proxy] ⚡ SIGNAL REÇU DU NŒUD JS -> Exécution #${activeExecutionId} | trace_id: ${activeTraceId}`);
-
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'registered', executionId: activeExecutionId, traceId: activeTraceId }));
-        return;
-      }
-    }
-  }
 
   if (req.method === 'HEAD' || reqUrl === '/' || reqUrl === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
@@ -229,7 +237,7 @@ const server = http.createServer(async (req, res) => {
               };
             }
 
-            // Reconversion binaire Float32LE -> Base64 pour le nœud n8n Embeddings OpenAI
+            // Reconversion Float32LE -> Base64 pour n8n Embeddings OpenAI
             if (json.data && isEmbedding && Array.isArray(json.data[0]?.embedding)) {
               const emb = json.data[0].embedding;
               const buffer = Buffer.allocUnsafe(emb.length * 4);
