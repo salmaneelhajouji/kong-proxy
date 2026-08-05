@@ -21,7 +21,7 @@ function deriveSpanId(seed) {
   return crypto.createHash("sha256").update(String(seed) + "-span").digest("hex").slice(0, 16);
 }
 
-// 🔹 Fallback via API n8n si aucun ID valide n'est fourni
+// 🔹 Secours API n8n (uniquement si le signal /register-execution n'a pas été reçu)
 async function getParentExecutionTraceId() {
   const now = Date.now();
   if (activeTraceId && (now - lastRegisterTime < LOCK_TTL_MS)) {
@@ -63,24 +63,23 @@ const server = http.createServer(async (req, res) => {
   const reqUrl = req.url || "/";
   console.log(`→ ${req.method} ${reqUrl}`);
 
-  // 1. EXTRACTION & NETTOYAGE STRICT DE L'EXEC_ID (Conservation uniquement des chiffres)
-  const parsedUrl = new URL(reqUrl, `http://${req.headers.host || 'localhost'}`);
-  let rawExecId = parsedUrl.searchParams.get('exec_id') || parsedUrl.searchParams.get('id');
+  // 1. ⚡ RÉCEPTION DU SIGNAL DU NŒUD "Code in JavaScript"
+  if (reqUrl.includes('/register-execution')) {
+    const parsedUrl = new URL(reqUrl, `http://${req.headers.host || 'localhost'}`);
+    const execId = parsedUrl.searchParams.get('id');
 
-  if (rawExecId) {
-    const cleanIdMatch = rawExecId.match(/\d+/);
-    if (cleanIdMatch) {
-      activeExecutionId = cleanIdMatch[0];
+    if (execId) {
+      activeExecutionId = String(execId);
       activeTraceId = deriveTraceId(activeExecutionId);
       lastRegisterTime = Date.now();
-      console.log(`[proxy] 🎯 EXEC_ID NETTOYÉ EN DIRECT -> #${activeExecutionId} | trace_id: ${activeTraceId}`);
-    }
-  }
+      traceCallCounters.delete(activeTraceId);
 
-  if (reqUrl.includes('/register-execution') && activeExecutionId) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'registered', executionId: activeExecutionId, traceId: activeTraceId }));
-    return;
+      console.log(`[proxy] ⚡ SIGNAL REÇU DU NŒUD JS - Exécution Verrouillée #${activeExecutionId} -> trace_id: ${activeTraceId}`);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'registered', executionId: activeExecutionId, traceId: activeTraceId }));
+      return;
+    }
   }
 
   if (req.method === 'HEAD' || reqUrl === '/' || reqUrl === '/health') {
@@ -107,7 +106,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 2. RÉSOLVEUR DE TRACE UNIFIÉE
+  // 2. RÉSOLUTION DU TRACE_ID
   let traceId = activeTraceId;
   let execId = activeExecutionId;
 
@@ -226,13 +225,13 @@ const server = http.createServer(async (req, res) => {
               };
             }
 
-            // 🔹 RECONVERSION EN BASE64 POUR N8N (Résout l'erreur des zéro `[0,0,0...]`)
+            // Reconversion binaire Float32LE -> Base64 pour le nœud n8n Embeddings OpenAI
             if (json.data && isEmbedding && Array.isArray(json.data[0]?.embedding)) {
               const emb = json.data[0].embedding;
               const buffer = Buffer.allocUnsafe(emb.length * 4);
               emb.forEach((val, i) => buffer.writeFloatLE(val, i * 4));
               json.data[0].embedding = buffer.toString('base64');
-              
+
               const modBody = Buffer.from(JSON.stringify(json));
               const modHeaders = { ...proxyRes.headers, 'content-length': modBody.length };
               res.writeHead(proxyRes.statusCode, modHeaders);
