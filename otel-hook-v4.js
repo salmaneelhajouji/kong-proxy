@@ -307,7 +307,6 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     if (nodeStartMs < startMs) nodeStartMs = startMs;
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
-    // 🎯 ID DÉTERMINISTE UNIQUE DÉRIVÉ AVEC LE RUN_INDEX
     forcedNextSpanId = deriveSpanId(`${node.executionId}_node_${nodeName}_${runIndex}`);
 
     let parentCtxToUse = rootCtx;
@@ -359,7 +358,6 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
 
     childSpan.setStatus({ code: toOtelStatusCode(node.status) });
 
-    // Stockage du contexte sous les deux clés (indexée et générique)
     spanContextMap.set(`${nodeName}_${runIndex}`, childSpan.spanContext());
     spanContextMap.set(nodeName, childSpan.spanContext());
 
