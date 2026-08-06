@@ -81,6 +81,7 @@ let lastUsage = {};
 
 const server = http.createServer(async (req, res) => {
   const reqUrl = req.url || "/";
+  console.log(`→ ${req.method} ${reqUrl}`);
 
   if (req.method === 'HEAD' || reqUrl === '/' || reqUrl === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
@@ -106,76 +107,56 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  const syncInfo = await getParentExecutionTraceId();
+  let traceId = syncInfo ? syncInfo.traceId : crypto.randomBytes(16).toString("hex");
+  let execId = syncInfo ? syncInfo.execId : "unknown";
+
+  if (!traceCallCounters.has(traceId)) {
+    traceCallCounters.set(traceId, { chat: 0, embedding: 0, mcp: 0 });
+    setTimeout(() => traceCallCounters.delete(traceId), 10 * 60 * 1000);
+  }
+  const counters = traceCallCounters.get(traceId);
+
   const isMcp = reqUrl.includes('/mcp-proxy');
   const isEmbedding = reqUrl.includes('/embeddings');
 
+  let parentSpanId;
+  let targetPath;
+
+  if (isMcp) {
+    targetPath = reqUrl.split('?')[0];
+    parentSpanId = deriveSpanId(`${execId}_node_MCP Client1_${counters.mcp}`);
+    counters.mcp++;
+  } else if (isEmbedding) {
+    targetPath = '/ai-api/v1/embeddings';
+    parentSpanId = deriveSpanId(`${execId}_node_Embeddings OpenAI_${counters.embedding}`);
+    counters.embedding++;
+  } else {
+    targetPath = '/ai-api/v1/chat/gemini';
+    parentSpanId = deriveSpanId(`${execId}_node_LLM_${counters.chat}`);
+    counters.chat++;
+  }
+
+  const unifiedTraceparent = `00-${traceId}-${parentSpanId}-01`;
+  const headers = { ...req.headers };
+  delete headers['authorization'];
+  delete headers['Authorization'];
+  delete headers['accept-encoding'];
+
+  headers['traceparent'] = unifiedTraceparent;
+  console.log(`→ Header transmis à Kong: ${unifiedTraceparent}`);
+
+  // 🚀 SIGNALEMENT GARANTI DE LA TRACE AU HOOK OTEL
+  triggerTraceFromTraceparent(unifiedTraceparent);
+
+  const requestStartTime = Date.now();
   let reqChunks = [];
+
   req.on('data', chunk => reqChunks.push(chunk));
-  req.on('end', async () => {
+  req.on('end', () => {
     let reqBody = Buffer.concat(reqChunks);
-    let jsonRpcMethod = null;
 
-    if (isMcp && reqBody.length > 0) {
-      try {
-        const bodyJson = JSON.parse(reqBody.toString());
-        jsonRpcMethod = bodyJson.method || null;
-      } catch (e) {}
-    }
-
-    // 🎯 FILTRAGE DU BRUIT MCP : Si c'est du polling/heartbeat (initialize, tools/list, ping), ne PAS injecter le traceparent applicatif
-    const isRealToolCall = isMcp && jsonRpcMethod === "tools/call";
-    const shouldInjectTrace = !isMcp || isRealToolCall;
-
-    const headers = { ...req.headers };
-    delete headers['authorization'];
-    delete headers['Authorization'];
-    delete headers['accept-encoding'];
-    delete headers['traceparent'];
-
-    let unifiedTraceparent = null;
-
-    if (shouldInjectTrace) {
-      const syncInfo = await getParentExecutionTraceId();
-      let traceId = syncInfo ? syncInfo.traceId : crypto.randomBytes(16).toString("hex");
-      let execId = syncInfo ? syncInfo.execId : "unknown";
-
-      if (!traceCallCounters.has(traceId)) {
-        traceCallCounters.set(traceId, { chat: 0, embedding: 0, mcp: 0 });
-        setTimeout(() => traceCallCounters.delete(traceId), 10 * 60 * 1000);
-      }
-      const counters = traceCallCounters.get(traceId);
-
-      let parentSpanId;
-      if (isMcp) {
-        parentSpanId = deriveSpanId(`${execId}_node_MCP Client1_${counters.mcp}`);
-        counters.mcp++;
-      } else if (isEmbedding) {
-        // Rattachement direct au nœud Embeddings OpenAI
-        parentSpanId = deriveSpanId(`${execId}_node_Embeddings OpenAI_${counters.embedding}`);
-        counters.embedding++;
-      } else {
-        parentSpanId = deriveSpanId(`${execId}_node_LLM_${counters.chat}`);
-        counters.chat++;
-      }
-
-      unifiedTraceparent = `00-${traceId}-${parentSpanId}-01`;
-      headers['traceparent'] = unifiedTraceparent;
-      console.log(`→ [${req.method}] ${reqUrl} | JSON-RPC Method: ${jsonRpcMethod || 'N/A'} -> Header transmis: ${unifiedTraceparent}`);
-      triggerTraceFromTraceparent(unifiedTraceparent);
-    } else {
-      console.log(`🧹 [BRUIT FILTRÉ] Request MCP non-outil (${jsonRpcMethod}) - Traceparent ignoré pour nettoyer Langfuse.`);
-    }
-
-    let targetPath;
-    if (isMcp) {
-      targetPath = reqUrl.split('?')[0];
-    } else if (isEmbedding) {
-      targetPath = '/ai-api/v1/embeddings';
-    } else {
-      targetPath = '/ai-api/v1/chat/gemini';
-    }
-
-    if (!isMcp && reqBody.length > 0) {
+    if (!isMcp) {
       try {
         const reqJson = JSON.parse(reqBody.toString());
         if (isEmbedding) {
@@ -184,6 +165,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         const hasToolResult = reqJson.messages && reqJson.messages.some(m => m.role === 'tool');
+
         if (hasToolResult) {
           const systemMsg = reqJson.messages.find(m => m.role === 'system');
           const userMsg = reqJson.messages.find(m => m.role === 'user');
@@ -209,7 +191,6 @@ const server = http.createServer(async (req, res) => {
       } catch(e) {}
     }
 
-    const requestStartTime = Date.now();
     const options = {
       hostname: "35.198.99.79",
       port: 8443,
