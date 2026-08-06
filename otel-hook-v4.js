@@ -307,7 +307,8 @@ async function buildAndExportUnifiedSpans(allParsed, traceId) {
     if (nodeStartMs < startMs) nodeStartMs = startMs;
     if (nodeEndMs <= nodeStartMs) nodeEndMs = nodeStartMs + 10;
 
-    forcedNextSpanId = deriveSpanId(`${node.executionId}_node_${nodeName}_${runIndex}`);
+    // 🎯 FIX CRUCIAL : Utiliser IMPÉRATIVEMENT mainParent.executionId pour TOUS les nœuds
+    forcedNextSpanId = deriveSpanId(`${mainParent.executionId}_node_${nodeName}_${runIndex}`);
 
     let parentCtxToUse = rootCtx;
 
