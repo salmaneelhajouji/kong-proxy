@@ -14,48 +14,6 @@ const LOCK_TTL_MS = 2 * 60 * 1000;
 
 const MCP_SERVER_WORKFLOW_ID = "BMxUfKVV5C0rvQzo";
 
-// --- GESTION DU JETON AUTH0 (M2M) ---
-let cachedAuth0Token = null;
-let tokenExpiresAt = 0;
-
-async function getAuth0Token() {
-  const now = Date.now();
-  if (cachedAuth0Token && now < tokenExpiresAt - 5 * 60 * 1000) {
-    return cachedAuth0Token;
-  }
-
-  const domain = (process.env.AUTH0_DOMAIN || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
-  if (!domain || !process.env.AUTH0_CLIENT_SECRET) {
-    return null;
-  }
-
-  try {
-    const resp = await fetch(`https://${domain}/oauth/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: process.env.AUTH0_CLIENT_ID,
-        client_secret: process.env.AUTH0_CLIENT_SECRET,
-        audience: process.env.AUTH0_AUDIENCE,
-        grant_type: 'client_credentials'
-      })
-    });
-
-    if (resp.ok) {
-      const data = await resp.json();
-      cachedAuth0Token = data.access_token;
-      tokenExpiresAt = now + (data.expires_in * 1000);
-      console.log("🔒 [proxy] Jeton M2M Auth0 récupéré avec succès.");
-      return cachedAuth0Token;
-    } else {
-      console.error("❌ [proxy] Erreur Auth0 :", await resp.text());
-    }
-  } catch (e) {
-    console.error("❌ [proxy] Erreur d'appel Auth0 :", e.message);
-  }
-  return null;
-}
-
 function deriveTraceId(seed) {
   return crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
 }
@@ -151,11 +109,13 @@ const server = http.createServer(async (req, res) => {
   const isMcp = reqUrl.includes('/mcp-proxy');
   const isEmbedding = reqUrl.includes('/embeddings');
 
+  // 1. On lit le body de la requête en premier
   let reqChunks = [];
   req.on('data', chunk => reqChunks.push(chunk));
   req.on('end', async () => {
     let reqBody = Buffer.concat(reqChunks);
 
+    // 2. Inspection de la méthode JSON-RPC MCP
     let jsonRpcMethod = null;
     if (isMcp && reqBody.length > 0) {
       try {
@@ -164,20 +124,15 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {}
     }
 
+    // 3. Filtrage du bruit : On n'injecte le traceparent QUE pour les vrais tool calls ou les requêtes AI/Embeddings
     const isMcpToolCall = isMcp && req.method === 'POST' && jsonRpcMethod === "tools/call";
     const shouldInjectTrace = !isMcp || isMcpToolCall;
 
     const headers = { ...req.headers };
+    delete headers['authorization'];
+    delete headers['Authorization'];
     delete headers['accept-encoding'];
     delete headers['traceparent'];
-
-    // 🎯 INJECTION DU JETON AUTH0 UNIQUEMENT POUR LA ROUTE MCP
-    if (isMcp) {
-      const token = await getAuth0Token();
-      if (token) {
-        headers['authorization'] = `Bearer ${token}`;
-      }
-    }
 
     if (shouldInjectTrace) {
       const syncInfo = await getParentExecutionTraceId();
@@ -195,9 +150,11 @@ const server = http.createServer(async (req, res) => {
         parentSpanId = deriveSpanId(`${execId}_node_MCP Client1_${counters.mcp}`);
         counters.mcp++;
       } else if (isEmbedding) {
+        // Rattachement direct sous le nœud Embeddings OpenAI
         parentSpanId = deriveSpanId(`${execId}_node_Embeddings OpenAI_${counters.embedding}`);
         counters.embedding++;
       } else {
+        // Rattachement direct sous le nœud LLM correspondante (LLM_0 ou LLM_1)
         parentSpanId = deriveSpanId(`${execId}_node_LLM_${counters.chat}`);
         counters.chat++;
       }
@@ -211,6 +168,7 @@ const server = http.createServer(async (req, res) => {
       console.log(`🧹 [BRUIT FILTRÉ] ${req.method} ${reqUrl} | Method: ${jsonRpcMethod || 'GET/SSE'} -> Traceparent ignoré.`);
     }
 
+    // 4. Ciblage des routes Kong Gateway
     let targetPath;
     if (isMcp) {
       targetPath = reqUrl.split('?')[0];
