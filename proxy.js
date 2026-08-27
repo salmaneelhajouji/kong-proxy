@@ -129,8 +129,12 @@ const server = http.createServer(async (req, res) => {
     const shouldInjectTrace = !isMcp || isMcpToolCall;
 
     const headers = { ...req.headers };
-    delete headers['authorization'];
-    delete headers['Authorization'];
+    // FIX: on ne supprime plus l'Authorization pour les requêtes MCP,
+    // car mcp-route est maintenant sécurisée par OpenID Connect (Bearer token requis par Kong)
+    if (!isMcp) {
+      delete headers['authorization'];
+      delete headers['Authorization'];
+    }
     delete headers['accept-encoding'];
     delete headers['traceparent'];
 
