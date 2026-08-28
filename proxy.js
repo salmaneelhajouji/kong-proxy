@@ -106,6 +106,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Modification 1 : Ajout de isWebhook
   const isMcp = reqUrl.includes('/mcp-proxy');
   const isEmbedding = reqUrl.includes('/embeddings');
   const isWebhook = reqUrl.includes('/webhook-proxy');
@@ -130,8 +131,8 @@ const server = http.createServer(async (req, res) => {
     const shouldInjectTrace = !isMcp || isMcpToolCall;
 
     const headers = { ...req.headers };
-    // FIX: on ne supprime plus l'Authorization pour les requêtes MCP,
-    // car mcp-route est maintenant sécurisée par OpenID Connect (Bearer token requis par Kong)
+
+    // Modification 2 : Ne plus supprimer Authorization pour Webhook
     if (!isMcp && !isWebhook) {
       delete headers['authorization'];
       delete headers['Authorization'];
@@ -173,7 +174,7 @@ const server = http.createServer(async (req, res) => {
       console.log(`🧹 [BRUIT FILTRÉ] ${req.method} ${reqUrl} | Method: ${jsonRpcMethod || 'GET/SSE'} -> Traceparent ignoré.`);
     }
 
-    // 4. Ciblage des routes Kong Gateway
+    // Modification 3 : Ajout de la route du webhook dans le ciblage
     let targetPath;
     if (isMcp) {
       targetPath = reqUrl.split('?')[0];
@@ -185,6 +186,7 @@ const server = http.createServer(async (req, res) => {
       targetPath = '/ai-api/v1/chat/gemini';
     }
 
+    // Modification 4 : Ne pas transformer le body du webhook
     if (!isMcp && !isWebhook && reqBody.length > 0) {
       try {
         const reqJson = JSON.parse(reqBody.toString());
@@ -237,7 +239,8 @@ const server = http.createServer(async (req, res) => {
       proxyRes.on('end', () => {
         const body = Buffer.concat(chunks);
 
-        if (!isMcp) {
+        // Modification 5 : Ne pas parser la réponse du webhook comme du LLM
+        if (!isMcp && !isWebhook) {
           try {
             const json = JSON.parse(body.toString());
             if (json.usage && !isEmbedding && json.choices?.[0]?.message?.content) {
@@ -265,7 +268,14 @@ const server = http.createServer(async (req, res) => {
           } catch(e) {}
         }
 
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        // Modification 6 : Ajoute les headers CORS dans la réponse
+        const responseHeaders = { ...proxyRes.headers };
+        if (isWebhook) {
+          responseHeaders['access-control-allow-origin'] = '*';
+          responseHeaders['access-control-allow-methods'] = 'POST, OPTIONS';
+          responseHeaders['access-control-allow-headers'] = 'Authorization, Content-Type';
+        }
+        res.writeHead(proxyRes.statusCode, responseHeaders);
         res.end(body);
       });
     });
@@ -278,6 +288,18 @@ const server = http.createServer(async (req, res) => {
     proxy.write(reqBody);
     proxy.end();
   });
+});
+
+// Modification 7 : Gère les requêtes OPTIONS (préflight CORS)
+server.on('request', (req, res) => {
+  if (req.method === 'OPTIONS' && (req.url || '').includes('/webhook-proxy')) {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type'
+    });
+    res.end();
+  }
 });
 
 const PORT = process.env.PORT || 3000;
