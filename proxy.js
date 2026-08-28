@@ -108,6 +108,7 @@ const server = http.createServer(async (req, res) => {
 
   const isMcp = reqUrl.includes('/mcp-proxy');
   const isEmbedding = reqUrl.includes('/embeddings');
+  const isWebhook = reqUrl.includes('/webhook-proxy');
 
   // 1. On lit le body de la requête en premier
   let reqChunks = [];
@@ -131,7 +132,7 @@ const server = http.createServer(async (req, res) => {
     const headers = { ...req.headers };
     // FIX: on ne supprime plus l'Authorization pour les requêtes MCP,
     // car mcp-route est maintenant sécurisée par OpenID Connect (Bearer token requis par Kong)
-    if (!isMcp) {
+    if (!isMcp && !isWebhook) {
       delete headers['authorization'];
       delete headers['Authorization'];
     }
@@ -176,13 +177,15 @@ const server = http.createServer(async (req, res) => {
     let targetPath;
     if (isMcp) {
       targetPath = reqUrl.split('?')[0];
+    } else if (isWebhook) {
+      targetPath = reqUrl.split('?')[0];
     } else if (isEmbedding) {
       targetPath = '/ai-api/v1/embeddings';
     } else {
       targetPath = '/ai-api/v1/chat/gemini';
     }
 
-    if (!isMcp && reqBody.length > 0) {
+    if (!isMcp && !isWebhook && reqBody.length > 0) {
       try {
         const reqJson = JSON.parse(reqBody.toString());
         if (isEmbedding) {
