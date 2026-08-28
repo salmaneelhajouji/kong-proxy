@@ -82,6 +82,17 @@ let lastUsage = {};
 const server = http.createServer(async (req, res) => {
   const reqUrl = req.url || "/";
 
+  // Gestion des requêtes OPTIONS (préflight CORS) pour /webhook-proxy
+  if (req.method === 'OPTIONS' && reqUrl.includes('/webhook-proxy')) {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type'
+    });
+    res.end();
+    return;
+  }
+
   if (req.method === 'HEAD' || reqUrl === '/' || reqUrl === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ status: 'ok' }));
@@ -106,7 +117,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Modification 1 : Ajout de isWebhook
   const isMcp = reqUrl.includes('/mcp-proxy');
   const isEmbedding = reqUrl.includes('/embeddings');
   const isWebhook = reqUrl.includes('/webhook-proxy');
@@ -132,7 +142,6 @@ const server = http.createServer(async (req, res) => {
 
     const headers = { ...req.headers };
 
-    // Modification 2 : Ne plus supprimer Authorization pour Webhook
     if (!isMcp && !isWebhook) {
       delete headers['authorization'];
       delete headers['Authorization'];
@@ -174,7 +183,6 @@ const server = http.createServer(async (req, res) => {
       console.log(`🧹 [BRUIT FILTRÉ] ${req.method} ${reqUrl} | Method: ${jsonRpcMethod || 'GET/SSE'} -> Traceparent ignoré.`);
     }
 
-    // Modification 3 : Ajout de la route du webhook dans le ciblage
     let targetPath;
     if (isMcp) {
       targetPath = reqUrl.split('?')[0];
@@ -186,7 +194,6 @@ const server = http.createServer(async (req, res) => {
       targetPath = '/ai-api/v1/chat/gemini';
     }
 
-    // Modification 4 : Ne pas transformer le body du webhook
     if (!isMcp && !isWebhook && reqBody.length > 0) {
       try {
         const reqJson = JSON.parse(reqBody.toString());
@@ -239,7 +246,6 @@ const server = http.createServer(async (req, res) => {
       proxyRes.on('end', () => {
         const body = Buffer.concat(chunks);
 
-        // Modification 5 : Ne pas parser la réponse du webhook comme du LLM
         if (!isMcp && !isWebhook) {
           try {
             const json = JSON.parse(body.toString());
@@ -268,7 +274,6 @@ const server = http.createServer(async (req, res) => {
           } catch(e) {}
         }
 
-        // Modification 6 : Ajoute les headers CORS dans la réponse
         const responseHeaders = { ...proxyRes.headers };
         if (isWebhook) {
           responseHeaders['access-control-allow-origin'] = '*';
@@ -288,18 +293,6 @@ const server = http.createServer(async (req, res) => {
     proxy.write(reqBody);
     proxy.end();
   });
-});
-
-// Modification 7 : Gère les requêtes OPTIONS (préflight CORS)
-server.on('request', (req, res) => {
-  if (req.method === 'OPTIONS' && (req.url || '').includes('/webhook-proxy')) {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Authorization, Content-Type'
-    });
-    res.end();
-  }
 });
 
 const PORT = process.env.PORT || 3000;
